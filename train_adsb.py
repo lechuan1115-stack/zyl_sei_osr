@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-import argparse
+from dataclasses import dataclass
 import json
 import random
 from pathlib import Path
@@ -23,91 +23,40 @@ from pytorchtools import EarlyStopping
 from utils import AverageMeter
 
 # ---------------------------------------------------------------------------
-# Argument parsing and reproducibility helpers
+# Configuration and reproducibility helpers
 # ---------------------------------------------------------------------------
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--train-data",
-        type=Path,
-        required=True,
-        help=(
-            "Path to the MATLAB v7.3 (.mat) file containing the training "
-            "samples (will be split into train/validation)."
-        ),
-    )
-    parser.add_argument(
-        "--test-data",
-        type=Path,
-        required=True,
-        help="Path to the MATLAB v7.3 (.mat) file containing the held-out test set.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("training_outputs"),
-        help="Directory where models, logs and figures will be stored.",
-    )
-    parser.add_argument("--epochs", type=int, default=80, help="Maximum number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=128, help="Mini-batch size.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate.")
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=1e-4,
-        help="Weight decay used by the AdamW optimiser.",
-    )
-    parser.add_argument(
-        "--patience",
-        type=int,
-        default=12,
-        help="Number of epochs with no validation improvement before early stopping.",
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=0,
-        help="Number of worker processes used by the dataloaders.",
-    )
-    parser.add_argument(
-        "--val-ratio",
-        type=float,
-        default=0.1,
-        help="Fraction of the training set used for validation (0 < ratio < 1).",
-    )
-    parser.add_argument(
-        "--feature-key",
-        type=str,
-        default=None,
-        help="Optional dataset key containing the feature tensor.  Leave unset to auto-detect.",
-    )
-    parser.add_argument(
-        "--label-key",
-        type=str,
-        default=None,
-        help="Optional dataset key containing the labels.  Leave unset to auto-detect.",
-    )
-    parser.add_argument(
-        "--test-feature-key",
-        type=str,
-        default=None,
-        help="Optional dataset key containing the test feature tensor.",
-    )
-    parser.add_argument(
-        "--test-label-key",
-        type=str,
-        default=None,
-        help="Optional dataset key containing the test labels.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed used for dataset splitting and weight initialisation.",
-    )
-    return parser.parse_args()
+@dataclass
+class TrainingConfig:
+    """Container holding the full training configuration.
+
+    All hyper-parameters can be tweaked by modifying the dataclass fields below.
+    This avoids the need for command-line arguments and makes experiments fully
+    reproducible from within the script itself.
+    """
+
+    train_data: Path
+    test_data: Path
+    output_dir: Path = Path("training_outputs")
+    epochs: int = 80
+    batch_size: int = 128
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    patience: int = 12
+    num_workers: int = 0
+    val_ratio: float = 0.1
+    feature_key: str | None = None
+    label_key: str | None = None
+    test_feature_key: str | None = None
+    test_label_key: str | None = None
+    seed: int = 42
+
+
+DEFAULT_CONFIG = TrainingConfig(
+    train_data=Path(r"E:\数据集\ADS-B_Train_10X360-2_5-10-15-20dB.mat"),
+    test_data=Path(r"E:\数据集\ADS-B_Test_10X360-2_5-10-15-20dB.mat"),
+)
 
 
 def set_seed(seed: int) -> None:
@@ -273,26 +222,25 @@ def plot_training_curves(history: Dict[str, list], output_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    args = parse_args()
-    set_seed(args.seed)
+def main(config: TrainingConfig = DEFAULT_CONFIG) -> None:
+    set_seed(config.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
 
     train_loader, val_loader, test_loader = create_dataloaders(
-        args.train_data,
-        test_mat_path=args.test_data,
-        val_ratio=args.val_ratio,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        feature_key=args.feature_key,
-        label_key=args.label_key,
-        test_feature_key=args.test_feature_key,
-        test_label_key=args.test_label_key,
-        seed=args.seed,
+        config.train_data,
+        test_mat_path=config.test_data,
+        val_ratio=config.val_ratio,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        feature_key=config.feature_key,
+        label_key=config.label_key,
+        test_feature_key=config.test_feature_key,
+        test_label_key=config.test_label_key,
+        seed=config.seed,
     )
 
     num_classes = len(np.unique(train_loader.dataset.labels.cpu().numpy()))
@@ -300,15 +248,15 @@ def main() -> None:
 
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=4, verbose=True
     )
     early_stopping = EarlyStopping(
-        patience=args.patience,
+        patience=config.patience,
         verbose=True,
-        path=str(args.output_dir / "best_model.pt"),
+        path=str(config.output_dir / "best_model.pt"),
     )
 
     history: Dict[str, list] = {
@@ -318,7 +266,7 @@ def main() -> None:
         "val_acc": [],
     }
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, config.epochs + 1):
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, device
         )
@@ -345,11 +293,11 @@ def main() -> None:
             break
 
     # Restore the best checkpoint (lowest validation loss).
-    best_model_path = args.output_dir / "best_model.pt"
+    best_model_path = config.output_dir / "best_model.pt"
     if best_model_path.exists():
         model.load_state_dict(torch.load(best_model_path, map_location=device))
 
-    plot_training_curves(history, args.output_dir)
+    plot_training_curves(history, config.output_dir)
 
     # Evaluate on the held-out test set.
     test_loss, test_acc, y_true, y_pred = evaluate(
@@ -363,7 +311,7 @@ def main() -> None:
         "test_loss": test_loss,
         "test_accuracy": test_acc,
     }
-    with open(args.output_dir / "metrics.json", "w", encoding="utf-8") as fp:
+    with open(config.output_dir / "metrics.json", "w", encoding="utf-8") as fp:
         json.dump(metrics, fp, indent=2)
 
     report = classification_report(
@@ -373,7 +321,7 @@ def main() -> None:
         output_dict=True,
         zero_division=0,
     )
-    with open(args.output_dir / "classification_report.json", "w", encoding="utf-8") as fp:
+    with open(config.output_dir / "classification_report.json", "w", encoding="utf-8") as fp:
         json.dump(report, fp, indent=2)
 
     class_names = [f"Class {idx}" for idx in sorted(np.unique(y_true))]
@@ -383,7 +331,7 @@ def main() -> None:
         class_names=class_names,
         normalize=True,
         title="Normalised confusion matrix",
-        save_path=args.output_dir / "confusion_matrix.png",
+        save_path=config.output_dir / "confusion_matrix.png",
     )
     plt.close(fig)
 
@@ -394,11 +342,9 @@ def main() -> None:
         class_names=class_names,
         normalize=False,
         title="Confusion matrix (counts)",
-        save_path=args.output_dir / "confusion_matrix_counts.png",
+        save_path=config.output_dir / "confusion_matrix_counts.png",
     )
     plt.close(fig)
-
-    print("Training artefacts written to", args.output_dir.resolve())
 
 
 if __name__ == "__main__":  # pragma: no cover - script entry point
