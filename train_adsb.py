@@ -14,7 +14,10 @@ from typing import Dict, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
+from sklearn.manifold import TSNE
 from sklearn.metrics import classification_report
+from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 
 from Confusion_matrix import plot_confusion_matrix
@@ -282,20 +285,22 @@ def evaluate(
     criterion: torch.nn.Module,
     device: torch.device,
     *,
-    collect_predictions: bool = False,
-) -> Tuple[float, float, np.ndarray | None, np.ndarray | None]:
+    collect_details: bool = False,
+) -> Tuple[float, float, Dict[str, np.ndarray] | None]:
     model.eval()
     loss_meter = AverageMeter()
     acc_meter = AverageMeter()
-    all_targets = []
-    all_preds = []
+    all_targets: list[np.ndarray] = []
+    all_preds: list[np.ndarray] = []
+    all_features: list[np.ndarray] = []
+    all_probs: list[np.ndarray] = []
 
     with torch.no_grad():
         for inputs, targets in dataloader:
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            outputs, _ = model(inputs)
+            outputs, features = model(inputs)
             loss = criterion(outputs, targets)
 
             preds = outputs.argmax(dim=1)
@@ -303,17 +308,22 @@ def evaluate(
             loss_meter.update(loss.item(), inputs.size(0))
             acc_meter.update(batch_acc, inputs.size(0))
 
-            if collect_predictions:
+            if collect_details:
                 all_targets.append(targets.cpu().numpy())
                 all_preds.append(preds.cpu().numpy())
+                all_features.append(features.cpu().numpy())
+                all_probs.append(F.softmax(outputs, dim=1).cpu().numpy())
 
-    if collect_predictions:
-        y_true = np.concatenate(all_targets)
-        y_pred = np.concatenate(all_preds)
-    else:
-        y_true = y_pred = None
+    details = None
+    if collect_details:
+        details = {
+            "y_true": np.concatenate(all_targets),
+            "y_pred": np.concatenate(all_preds),
+            "features": np.concatenate(all_features),
+            "probabilities": np.concatenate(all_probs),
+        }
 
-    return loss_meter.avg, acc_meter.avg, y_true, y_pred
+    return loss_meter.avg, acc_meter.avg, details
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +355,170 @@ def plot_training_curves(history: Dict[str, list], output_dir: Path) -> None:
     fig.tight_layout()
     output_dir.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_dir / "training_curves.png", dpi=300)
+    plt.close(fig)
+
+
+def plot_tsne_embeddings(
+    features: np.ndarray,
+    labels: np.ndarray,
+    output_dir: Path,
+    *,
+    seed: int,
+    max_points: int = 5000,
+) -> None:
+    """Project the high-dimensional features to 2-D with t-SNE."""
+
+    if features.shape[0] < 2:
+        return
+
+    rng = np.random.default_rng(seed)
+    if features.shape[0] > max_points:
+        indices = rng.choice(features.shape[0], size=max_points, replace=False)
+        features = features[indices]
+        labels = labels[indices]
+
+    scaler = StandardScaler()
+    features_std = scaler.fit_transform(features)
+
+    max_valid = max(1, features_std.shape[0] - 1)
+    perplexity = min(30, max_valid)
+    perplexity = max(perplexity, min(5, max_valid))
+
+    tsne = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        init="pca",
+        learning_rate="auto",
+        random_state=seed,
+    )
+    embeddings = tsne.fit_transform(features_std)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    cmap = plt.cm.get_cmap("tab10", int(labels.max() + 1))
+    scatter = ax.scatter(
+        embeddings[:, 0],
+        embeddings[:, 1],
+        c=labels,
+        cmap=cmap,
+        s=10,
+        alpha=0.8,
+    )
+    legend_handles = scatter.legend_elements()[0]
+    class_names = [f"Class {idx}" for idx in np.unique(labels)]
+    ax.legend(legend_handles, class_names, title="Classes", loc="best", fontsize="small")
+    ax.set_title("t-SNE projection of test embeddings")
+    ax.set_xlabel("Component 1")
+    ax.set_ylabel("Component 2")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_dir / "tsne_embeddings.png", dpi=300)
+    plt.close(fig)
+
+
+def plot_distance_distributions(
+    features: np.ndarray,
+    labels: np.ndarray,
+    output_dir: Path,
+    *,
+    seed: int,
+    num_pairs: int = 20000,
+) -> None:
+    """Visualise intra/inter class distance distributions."""
+
+    if features.shape[0] < 2:
+        return
+
+    rng = np.random.default_rng(seed)
+    idx1 = rng.integers(0, features.shape[0], size=num_pairs)
+    idx2 = rng.integers(0, features.shape[0], size=num_pairs)
+
+    same_class = labels[idx1] == labels[idx2]
+    valid = idx1 != idx2
+    same_class &= valid
+    different_class = (~same_class) & valid
+
+    diffs = features[idx1] - features[idx2]
+    dists = np.linalg.norm(diffs, axis=1)
+
+    intra = dists[same_class]
+    inter = dists[different_class]
+
+    if intra.size == 0 or inter.size == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(intra, bins=50, alpha=0.6, label="Intra-class", color="#1f77b4", density=True)
+    ax.hist(inter, bins=50, alpha=0.6, label="Inter-class", color="#ff7f0e", density=True)
+    ax.set_title("Feature distance distributions")
+    ax.set_xlabel("Euclidean distance")
+    ax.set_ylabel("Density")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / "feature_distance_distribution.png", dpi=300)
+    plt.close(fig)
+
+
+def plot_per_class_accuracy(report: Dict[str, dict], output_dir: Path) -> None:
+    """Render a bar chart for per-class recall (accuracy)."""
+
+    class_ids = sorted(k for k in report.keys() if k.isdigit())
+    if not class_ids:
+        return
+
+    recalls = [report[k]["recall"] for k in class_ids]
+    labels = [f"Class {int(k)}" for k in class_ids]
+
+    x = np.arange(len(labels))
+    colors = plt.cm.tab10.colors[: len(labels)]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    bars = ax.bar(x, recalls, color=colors)
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("Recall")
+    ax.set_title("Per-class accuracy")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.grid(True, axis="y", linestyle="--", alpha=0.4)
+    ax.bar_label(bars, labels=[f"{recall*100:.1f}%" for recall in recalls], padding=3)
+    fig.tight_layout()
+    fig.savefig(output_dir / "per_class_accuracy.png", dpi=300)
+    plt.close(fig)
+
+
+def plot_confidence_histogram(
+    probabilities: np.ndarray,
+    y_pred: np.ndarray,
+    y_true: np.ndarray,
+    output_dir: Path,
+) -> None:
+    """Plot a histogram of prediction confidences."""
+
+    confidences = probabilities.max(axis=1)
+    correct_mask = y_pred == y_true
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(
+        confidences[correct_mask],
+        bins=30,
+        alpha=0.7,
+        label="Correct",
+        color="#2ca02c",
+        range=(0, 1),
+    )
+    ax.hist(
+        confidences[~correct_mask],
+        bins=30,
+        alpha=0.7,
+        label="Incorrect",
+        color="#d62728",
+        range=(0, 1),
+    )
+    ax.set_title("Prediction confidence distribution")
+    ax.set_xlabel("Maximum softmax confidence")
+    ax.set_ylabel("Count")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / "confidence_histogram.png", dpi=300)
     plt.close(fig)
 
 
@@ -430,7 +604,7 @@ def main() -> None:
             total_epochs=args.epochs,
             log_interval=args.log_interval,
         )
-        val_loss, val_acc, _, _ = evaluate(
+        val_loss, val_acc, _ = evaluate(
             model, val_loader, criterion, device
         )
 
@@ -468,9 +642,14 @@ def main() -> None:
     plot_training_curves(history, args.output_dir)
 
     # Evaluate on the held-out test set.
-    test_loss, test_acc, y_true, y_pred = evaluate(
-        model, test_loader, criterion, device, collect_predictions=True
+    test_loss, test_acc, test_details = evaluate(
+        model, test_loader, criterion, device, collect_details=True
     )
+    assert test_details is not None
+    y_true = test_details["y_true"]
+    y_pred = test_details["y_pred"]
+    features = test_details["features"]
+    probabilities = test_details["probabilities"]
     print(f"Test loss: {test_loss:.4f} | Test accuracy: {test_acc:.4f}")
 
     # Persist metrics and detailed reports for later inspection.
@@ -479,6 +658,7 @@ def main() -> None:
         "test_loss": test_loss,
         "test_accuracy": test_acc,
         "dataset_summaries": split_summaries,
+        "best_epoch": best_snapshot,
     }
     with open(args.output_dir / "metrics.json", "w", encoding="utf-8") as fp:
         json.dump(metrics, fp, indent=2)
@@ -492,6 +672,8 @@ def main() -> None:
     )
     with open(args.output_dir / "classification_report.json", "w", encoding="utf-8") as fp:
         json.dump(report, fp, indent=2)
+
+    plot_per_class_accuracy(report, args.output_dir)
 
     class_names = [f"Class {idx}" for idx in sorted(np.unique(y_true))]
     fig = plot_confusion_matrix(
@@ -514,6 +696,10 @@ def main() -> None:
         save_path=args.output_dir / "confusion_matrix_counts.png",
     )
     plt.close(fig)
+
+    plot_tsne_embeddings(features, y_true, args.output_dir, seed=args.seed)
+    plot_distance_distributions(features, y_true, args.output_dir, seed=args.seed)
+    plot_confidence_histogram(probabilities, y_pred, y_true, args.output_dir)
 
     print("Training artefacts written to", args.output_dir.resolve())
 

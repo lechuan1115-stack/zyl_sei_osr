@@ -44,6 +44,13 @@ test file, trains the lightweight CNN–Transformer architecture and saves:
 - Training curves for loss and accuracy (`training_curves.png`).
 - Normalised and raw confusion matrices (`confusion_matrix.png` and
   `confusion_matrix_counts.png`).
+- A per-class accuracy bar chart (`per_class_accuracy.png`) to quickly spot
+  under-performing categories.
+- A test-set t-SNE projection (`tsne_embeddings.png`) capturing the spatial
+  organisation of the learnt representation and a feature distance histogram
+  contrasting intra- and inter-class separations (`feature_distance_distribution.png`).
+- A prediction confidence histogram (`confidence_histogram.png`) highlighting
+  calibration differences between correct and incorrect predictions.
 - JSON files containing the training history, final metrics and a detailed
   classification report.
 
