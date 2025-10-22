@@ -133,48 +133,67 @@ def load_adsb_dataset(
 
 
 def create_datasets(
-    mat_path: os.PathLike[str] | str,
+    train_mat_path: os.PathLike[str] | str,
     *,
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15,
-    test_ratio: float = 0.15,
+    test_mat_path: os.PathLike[str] | str,
+    val_ratio: float = 0.1,
     random_state: int = 42,
     feature_key: Optional[str] = None,
     label_key: Optional[str] = None,
+    test_feature_key: Optional[str] = None,
+    test_label_key: Optional[str] = None,
 ) -> Tuple[DatasetSplit, DatasetSplit, DatasetSplit]:
-    """Load the ADS-B dataset and split it into train/validation/test sets."""
+    """Create train/validation/test splits from dedicated dataset files.
 
-    if not np.isclose(train_ratio + val_ratio + test_ratio, 1.0):
-        raise ValueError("The split ratios must add up to 1.0.")
+    Parameters
+    ----------
+    train_mat_path:
+        Path to the MATLAB ``.mat`` file containing the combined training
+        samples.  The function will internally split this data into training and
+        validation subsets using ``val_ratio``.
+    test_mat_path:
+        Path to the MATLAB ``.mat`` file containing the held-out test set.
+    val_ratio:
+        Fraction of the training samples used for validation.  The remainder is
+        used for training.
+    random_state:
+        Seed controlling the deterministic behaviour of ``train_test_split``.
+    feature_key / label_key:
+        Optional overrides selecting the arrays that contain the raw signals and
+        the labels inside the MATLAB file.  When unset the function will attempt
+        to infer them automatically.  ``test_feature_key`` and ``test_label_key``
+        provide the same overrides for the test dataset (falling back to the
+        training keys when omitted).
+    """
+
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError("`val_ratio` must be between 0 and 1 (exclusive).")
 
     data, labels = load_adsb_dataset(
-        mat_path,
+        train_mat_path,
         feature_key=feature_key,
         label_key=label_key,
     )
 
     stratify = labels if len(np.unique(labels)) > 1 else None
-    data_train, data_temp, label_train, label_temp = train_test_split(
+    data_train, data_val, label_train, label_val = train_test_split(
         data,
         labels,
-        test_size=1.0 - train_ratio,
+        test_size=val_ratio,
         random_state=random_state,
         stratify=stratify,
     )
 
-    val_share = test_ratio / (val_ratio + test_ratio)
-    data_val, data_test, label_val, label_test = train_test_split(
-        data_temp,
-        label_temp,
-        test_size=val_share,
-        random_state=random_state,
-        stratify=label_temp if stratify is not None else None,
+    test_data, test_labels = load_adsb_dataset(
+        test_mat_path,
+        feature_key=test_feature_key or feature_key,
+        label_key=test_label_key or label_key,
     )
 
     return (
         DatasetSplit(data_train, label_train),
         DatasetSplit(data_val, label_val),
-        DatasetSplit(data_test, label_test),
+        DatasetSplit(test_data, test_labels),
     )
 
 

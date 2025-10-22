@@ -30,10 +30,19 @@ from utils import AverageMeter
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--data",
+        "--train-data",
         type=Path,
         required=True,
-        help="Path to the ADS-B MATLAB v7.3 (.mat) file containing the dataset.",
+        help=(
+            "Path to the MATLAB v7.3 (.mat) file containing the training "
+            "samples (will be split into train/validation)."
+        ),
+    )
+    parser.add_argument(
+        "--test-data",
+        type=Path,
+        required=True,
+        help="Path to the MATLAB v7.3 (.mat) file containing the held-out test set.",
     )
     parser.add_argument(
         "--output-dir",
@@ -63,6 +72,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of worker processes used by the dataloaders.",
     )
     parser.add_argument(
+        "--val-ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of the training set used for validation (0 < ratio < 1).",
+    )
+    parser.add_argument(
         "--feature-key",
         type=str,
         default=None,
@@ -73,6 +88,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional dataset key containing the labels.  Leave unset to auto-detect.",
+    )
+    parser.add_argument(
+        "--test-feature-key",
+        type=str,
+        default=None,
+        help="Optional dataset key containing the test feature tensor.",
+    )
+    parser.add_argument(
+        "--test-label-key",
+        type=str,
+        default=None,
+        help="Optional dataset key containing the test labels.",
     )
     parser.add_argument(
         "--seed",
@@ -96,18 +123,26 @@ def set_seed(seed: int) -> None:
 
 
 def create_dataloaders(
-    mat_path: Path,
+    train_mat_path: Path,
     *,
+    test_mat_path: Path,
+    val_ratio: float,
     batch_size: int,
     num_workers: int,
     feature_key: str | None,
     label_key: str | None,
+    test_feature_key: str | None,
+    test_label_key: str | None,
     seed: int,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     train_split, val_split, test_split = create_datasets(
-        mat_path,
+        train_mat_path,
+        test_mat_path=test_mat_path,
+        val_ratio=val_ratio,
         feature_key=feature_key,
         label_key=label_key,
+        test_feature_key=test_feature_key,
+        test_label_key=test_label_key,
         random_state=seed,
     )
 
@@ -248,11 +283,15 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     train_loader, val_loader, test_loader = create_dataloaders(
-        args.data,
+        args.train_data,
+        test_mat_path=args.test_data,
+        val_ratio=args.val_ratio,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         feature_key=args.feature_key,
         label_key=args.label_key,
+        test_feature_key=args.test_feature_key,
+        test_label_key=args.test_label_key,
         seed=args.seed,
     )
 
