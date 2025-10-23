@@ -1,6 +1,12 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 -*-
-"""Complete training pipeline for the ADS-B signal classification task."""
+"""Complete closed-set training pipeline for the ADS-B signal classifier.
+
+The script trains and evaluates the model on the ADS-B dataset while
+restricting every split (train/validation/test) to the first seven
+classes.  The remaining three categories are reserved exclusively for
+open-set evaluation handled in ``open_set_evaluation.py``.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +20,6 @@ from typing import Dict, Sequence, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn as nn
 from sklearn.metrics import classification_report
 from torch.utils.data import DataLoader
 

@@ -2,15 +2,15 @@
 # -*- coding:utf-8 -*-
 """Open-set evaluation utilities for the ADS-B classifier.
 
-This module keeps the closed-set training script untouched while providing a
+This module leaves the closed-set training script untouched while providing a
 stand-alone workflow that can be executed after the classifier has been trained
-on all 10 classes.  During open-set evaluation the model is only expected to
-recognise the first seven classes, whereas the remaining three classes act as
-unknown examples.  The script benchmarks a suite of open-set detectors
-including OpenMax, MSP, entropy, energy, logit-margin, Mahalanobis, Gaussian
-NLL, prototype distances, KL-to-uniform, and feature-norm baselines while
-producing quantitative metrics together with visual
-diagnostics saved under ``open_set_outputs/``.
+on the first seven classes only.  During open-set evaluation the trained model
+is exposed to the full ten-class dataset: classes 0--6 are treated as known
+while classes 7--9 serve as unknown examples.  The script benchmarks a suite of
+open-set detectors including OpenMax, MSP, entropy, energy, logit-margin,
+Mahalanobis, Gaussian NLL, prototype distances, KL-to-uniform, and inverse
+feature-norm baselines while producing quantitative metrics together with
+visual diagnostics saved under ``open_set_outputs/``.
 
 The entry point is :func:`run_open_set_evaluation`, which can be executed
 directly via ``python open_set_evaluation.py``.
@@ -51,7 +51,6 @@ class OpenSetConfig:
     output_dir: Path = Path("open_set_outputs")
     batch_size: int = 256
     known_classes: Sequence[int] = tuple(range(7))
-    total_classes: int = 10
     tail_size: int = 25
     alpha: int = 5
     seed: int = 42
@@ -103,26 +102,6 @@ def _extract_embeddings(
     features = np.concatenate(features_list, axis=0)
     labels = np.concatenate(labels_list, axis=0)
     return logits, features, labels
-
-
-# ---------------------------------------------------------------------------
-# Logit handling
-# ---------------------------------------------------------------------------
-
-
-def _suppress_unknown_logits(
-    logits: np.ndarray,
-    known_classes: Sequence[int],
-    total_classes: int,
-    fill_value: float = -1e9,
-) -> np.ndarray:
-    """Mask logits that correspond to classes not considered known."""
-
-    mask = np.ones(total_classes, dtype=bool)
-    mask[list(known_classes)] = False
-    suppressed = logits.copy()
-    suppressed[:, mask] = fill_value
-    return suppressed
 
 
 # ---------------------------------------------------------------------------
@@ -565,16 +544,30 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
     unknown_test_data = test_data[unknown_mask_test]
     unknown_test_labels = test_labels[unknown_mask_test]
 
+    if known_train_data.size == 0 or known_test_data.size == 0:
+        raise RuntimeError(
+            "No samples from the configured known classes were found. "
+            "Check that the training pipeline used the same label indices."
+        )
+    if unknown_test_data.size == 0:
+        raise RuntimeError(
+            "No unknown-class samples detected in the test dataset. "
+            "Ensure classes beyond the known set remain present for open-set evaluation."
+        )
+
+    unknown_class_ids = sorted(set(int(label) for label in unknown_test_labels.tolist()))
+
     print(
         f"Known training samples: {known_train_data.shape[0]} | "
         f"Known test samples: {known_test_data.shape[0]} | "
-        f"Unknown test samples: {unknown_test_data.shape[0]}"
+        f"Unknown test samples: {unknown_test_data.shape[0]} | "
+        f"Unknown class ids: {unknown_class_ids}"
     )
 
     # ------------------------------------------------------------------
     # Load the trained classifier
     # ------------------------------------------------------------------
-    model = create_model("CNN_Transformer", num_classes=config.total_classes).to(device)
+    model = create_model("CNN_Transformer", num_classes=len(config.known_classes)).to(device)
     state_dict = torch.load(config.checkpoint_path, map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
@@ -589,9 +582,6 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
     train_logits, train_features, train_labels_known = _extract_embeddings(model, train_loader, device)
     known_logits, known_features, known_labels = _extract_embeddings(model, known_test_loader, device)
     unknown_logits, unknown_features, _ = _extract_embeddings(model, unknown_test_loader, device)
-
-    known_logits = _suppress_unknown_logits(known_logits, config.known_classes, config.total_classes)
-    unknown_logits = _suppress_unknown_logits(unknown_logits, config.known_classes, config.total_classes)
 
     # ------------------------------------------------------------------
     # Prepare detectors
