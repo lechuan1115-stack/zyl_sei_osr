@@ -24,6 +24,7 @@ from Confusion_matrix import plot_confusion_matrix
 from mydata_read import ADSBSignalDataset, create_datasets
 from mymodel1 import create as create_model
 from pytorchtools import EarlyStopping
+from torch.nn.utils import clip_grad_norm_
 from utils import AverageMeter
 
 # ---------------------------------------------------------------------------
@@ -43,16 +44,16 @@ class TrainingConfig:
     train_data: Path = Path(r"E:\数据集\ADS-B_Train_10X360-2_5-10-15-20dB.mat")
     test_data: Path = Path(r"E:\数据集\ADS-B_Test_10X360-2_5-10-15-20dB.mat")
     output_dir: Path = Path("training_outputs")
-    epochs: int = 80
+    epochs: int = 120
     batch_size: int = 128
-    lr: float = 1e-3
-    lr_factor: float = 0.5
-    lr_patience: int = 4
-    lr_threshold: float = 1e-4
-    min_lr: float = 1e-6
-    weight_decay: float = 1e-4
-    patience: int = 12
-    early_stop_delta: float = 1e-4
+    lr: float = 5e-4
+    min_lr: float = 5e-5
+    weight_decay: float = 5e-5
+    warmup_epochs: int = 8
+    patience: int = 20
+    min_epochs: int = 25
+    early_stop_delta: float = 5e-5
+    max_grad_norm: float = 5.0
     num_workers: int = 0
     val_ratio: float = 0.1
     feature_key: str | None = None
@@ -60,13 +61,22 @@ class TrainingConfig:
     test_feature_key: str | None = None
     test_label_key: str | None = None
     seed: int = 42
-    log_interval: int = 0
+    log_interval: int = 50
 
     def __post_init__(self) -> None:
         # Allow users to provide string paths in custom configurations.
         self.train_data = Path(self.train_data)
         self.test_data = Path(self.test_data)
         self.output_dir = Path(self.output_dir)
+
+        if self.warmup_epochs < 0:
+            raise ValueError("warmup_epochs must be non-negative")
+        if self.min_epochs < 1:
+            raise ValueError("min_epochs must be at least 1")
+        if self.epochs < self.min_epochs:
+            raise ValueError("epochs must be >= min_epochs")
+        if self.warmup_epochs >= self.epochs:
+            self.warmup_epochs = max(0, self.epochs - 1)
 
 
 CONFIG_PATH = Path("training_config.json")
@@ -82,7 +92,17 @@ def load_config() -> TrainingConfig:
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
             user_config = json.load(fp)
-        return TrainingConfig(**user_config)
+
+        valid_keys = TrainingConfig.__dataclass_fields__.keys()
+        filtered_config = {k: v for k, v in user_config.items() if k in valid_keys}
+        if len(filtered_config) != len(user_config):
+            unknown = sorted(set(user_config) - set(filtered_config))
+            if unknown:
+                print(
+                    "Ignoring unsupported configuration keys:",
+                    ", ".join(unknown),
+                )
+        return TrainingConfig(**filtered_config)
 
     # When no user configuration exists we still provide a template so that the
     # required keys are obvious for the next run.
@@ -180,6 +200,30 @@ def _summarise_split(name: str, dataset: ADSBSignalDataset) -> Dict[str, object]
 # ---------------------------------------------------------------------------
 
 
+def compute_epoch_lr(
+    *,
+    base_lr: float,
+    min_lr: float,
+    epoch: int,
+    total_epochs: int,
+    warmup_epochs: int,
+) -> float:
+    """Cosine decay with linear warm-up."""
+
+    epoch_index = epoch - 1
+    if warmup_epochs > 0 and epoch_index < warmup_epochs:
+        scale = (epoch_index + 1) / warmup_epochs
+        return max(min_lr, base_lr * scale)
+
+    if total_epochs <= warmup_epochs:
+        return max(min_lr, base_lr)
+
+    progress = (epoch_index - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+    cosine = 0.5 * (1 + np.cos(np.pi * np.clip(progress, 0.0, 1.0)))
+    lr = min_lr + (base_lr - min_lr) * cosine
+    return max(min_lr, lr)
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     dataloader: DataLoader,
@@ -190,6 +234,7 @@ def train_one_epoch(
     epoch: int,
     total_epochs: int,
     log_interval: int,
+    max_grad_norm: float | None,
 ) -> Tuple[float, float]:
     model.train()
     loss_meter = AverageMeter()
@@ -203,6 +248,8 @@ def train_one_epoch(
         outputs, _ = model(inputs)
         loss = criterion(outputs, targets)
         loss.backward()
+        if max_grad_norm is not None and max_grad_norm > 0:
+            clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
 
         preds = outputs.argmax(dim=1)
@@ -212,10 +259,10 @@ def train_one_epoch(
 
         if log_interval > 0 and batch_idx % log_interval == 0:
             print(
-                f"  [Epoch {epoch:03d}/{total_epochs:03d} | Batch {batch_idx:04d}/"
-                f"{len(dataloader):04d}] "
-                f"loss={loss_meter.avg:.4f} acc={acc_meter.avg * 100:.2f}%"
-            )
+            f"  [Epoch {epoch:03d}/{total_epochs:03d} | Batch {batch_idx:04d}/"
+            f"{len(dataloader):04d}] "
+            f"loss={loss_meter.avg:.4f} acc={acc_meter.avg * 100:.2f}%"
+        )
 
     return loss_meter.avg, acc_meter.avg
 
@@ -275,7 +322,7 @@ def evaluate(
 def plot_training_curves(history: Dict[str, list], output_dir: Path) -> None:
     epochs = range(1, len(history["train_loss"]) + 1)
 
-    fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+    fig, ax = plt.subplots(1, 3, figsize=(16, 4))
 
     ax[0].plot(epochs, history["train_loss"], label="Train", marker="o")
     ax[0].plot(epochs, history["val_loss"], label="Validation", marker="o")
@@ -292,6 +339,12 @@ def plot_training_curves(history: Dict[str, list], output_dir: Path) -> None:
     ax[1].set_ylabel("Accuracy")
     ax[1].grid(True, linestyle="--", alpha=0.5)
     ax[1].legend()
+
+    ax[2].plot(epochs, history["lr"], color="#9467bd", marker="o")
+    ax[2].set_title("Learning rate schedule")
+    ax[2].set_xlabel("Epoch")
+    ax[2].set_ylabel("Learning rate")
+    ax[2].grid(True, linestyle="--", alpha=0.5)
 
     fig.tight_layout()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -515,16 +568,6 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.lr, weight_decay=config.weight_decay
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=config.lr_factor,
-        patience=config.lr_patience,
-        threshold=config.lr_threshold,
-        threshold_mode="rel",
-        min_lr=config.min_lr,
-        verbose=True,
-    )
     early_stopping = EarlyStopping(
         patience=config.patience,
         verbose=True,
@@ -537,6 +580,7 @@ def main() -> None:
         "val_loss": [],
         "train_acc": [],
         "val_acc": [],
+        "lr": [],
     }
 
     best_snapshot = {
@@ -547,6 +591,15 @@ def main() -> None:
 
     for epoch in range(1, config.epochs + 1):
         epoch_start = time.time()
+        current_lr = compute_epoch_lr(
+            base_lr=config.lr,
+            min_lr=config.min_lr,
+            epoch=epoch,
+            total_epochs=config.epochs,
+            warmup_epochs=config.warmup_epochs,
+        )
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = current_lr
         train_loss, train_acc = train_one_epoch(
             model,
             train_loader,
@@ -556,27 +609,29 @@ def main() -> None:
             epoch=epoch,
             total_epochs=config.epochs,
             log_interval=config.log_interval,
+            max_grad_norm=config.max_grad_norm,
         )
         val_loss, val_acc, _ = evaluate(
             model, val_loader, criterion, device
         )
-
-        scheduler.step(val_loss)
         early_stopping(val_loss, model)
+        if epoch <= config.min_epochs:
+            early_stopping.early_stop = False
+            early_stopping.counter = 0
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["train_acc"].append(train_acc)
         history["val_acc"].append(val_acc)
+        history["lr"].append(current_lr)
 
         if val_loss < best_snapshot["val_loss"]:
             best_snapshot.update({"epoch": epoch, "val_loss": val_loss, "val_acc": val_acc})
 
-        lr = optimizer.param_groups[0]["lr"]
         elapsed = time.time() - epoch_start
         print(
             f"Epoch {epoch:03d}/{config.epochs:03d} | "
-            f"lr={lr:.6f} | "
+            f"lr={current_lr:.6f} | "
             f"train_loss={train_loss:.4f} train_acc={train_acc * 100:.2f}% | "
             f"val_loss={val_loss:.4f} val_acc={val_acc * 100:.2f}% | "
             f"best_val_acc={best_snapshot['val_acc'] * 100:.2f}% (epoch {best_snapshot['epoch']:03d}) | "
@@ -612,6 +667,10 @@ def main() -> None:
         "test_accuracy": test_acc,
         "dataset_summaries": split_summaries,
         "best_epoch": best_snapshot,
+        "config": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in config.__dict__.items()
+        },
     }
     with open(config.output_dir / "metrics.json", "w", encoding="utf-8") as fp:
         json.dump(metrics, fp, indent=2)
