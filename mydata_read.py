@@ -39,6 +39,7 @@ class DatasetSplit:
 
     data: np.ndarray
     labels: np.ndarray
+    metadata: dict | None = None
 
 
 class ADSBSignalDataset(Dataset):
@@ -142,7 +143,7 @@ def create_datasets(
     label_key: Optional[str] = None,
     test_feature_key: Optional[str] = None,
     test_label_key: Optional[str] = None,
-) -> Tuple[DatasetSplit, DatasetSplit, DatasetSplit]:
+) -> Tuple[DatasetSplit, DatasetSplit, DatasetSplit, dict[str, list[float]]]:
     """Create train/validation/test splits from dedicated dataset files.
 
     Parameters
@@ -175,6 +176,9 @@ def create_datasets(
         label_key=label_key,
     )
 
+    channel_stats = _compute_channelwise_stats(data)
+    data = _normalise_signals(data, channel_stats)
+
     stratify = labels if len(np.unique(labels)) > 1 else None
     data_train, data_val, label_train, label_val = train_test_split(
         data,
@@ -190,10 +194,16 @@ def create_datasets(
         label_key=test_label_key or label_key,
     )
 
+    test_data = _normalise_signals(test_data, channel_stats)
+
     return (
-        DatasetSplit(data_train, label_train),
-        DatasetSplit(data_val, label_val),
-        DatasetSplit(test_data, test_labels),
+        DatasetSplit(data_train, label_train, metadata={"split": "train"}),
+        DatasetSplit(data_val, label_val, metadata={"split": "valid"}),
+        DatasetSplit(test_data, test_labels, metadata={"split": "test"}),
+        {
+            "mean": channel_stats["mean"].flatten().tolist(),
+            "std": channel_stats["std"].flatten().tolist(),
+        },
     )
 
 
@@ -259,3 +269,19 @@ def _log_dataset_statistics(
         "num_classes": int(len(np.unique(labels))),
     }
     print(json.dumps(info, ensure_ascii=False))
+
+
+def _compute_channelwise_stats(data: np.ndarray) -> dict[str, np.ndarray]:
+    """Compute per-channel mean and standard deviation for normalisation."""
+
+    mean = data.mean(axis=(0, 2), keepdims=True)
+    std = data.std(axis=(0, 2), keepdims=True)
+    std = np.where(std < 1e-6, 1.0, std)
+    return {"mean": mean.astype(np.float32, copy=False), "std": std.astype(np.float32, copy=False)}
+
+
+def _normalise_signals(data: np.ndarray, stats: dict[str, np.ndarray]) -> np.ndarray:
+    """Apply channel-wise normalisation using the provided statistics."""
+
+    normalised = (data - stats["mean"]) / stats["std"]
+    return normalised.astype(np.float32, copy=False)
