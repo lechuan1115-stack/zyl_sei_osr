@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
-import argparse
+from dataclasses import dataclass
 import json
+import math
 import random
 from pathlib import Path
 from typing import Dict, Tuple
@@ -13,6 +14,7 @@ from typing import Dict, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 from sklearn.metrics import classification_report
 from torch.utils.data import DataLoader
 
@@ -22,92 +24,71 @@ from mymodel1 import create as create_model
 from pytorchtools import EarlyStopping
 from utils import AverageMeter
 
+from open_set import OpenSetSplit, determine_open_set_split, filter_by_classes
+from open_set_pipeline import run_open_set_pipeline
+
 # ---------------------------------------------------------------------------
-# Argument parsing and reproducibility helpers
+# Configuration and reproducibility helpers
 # ---------------------------------------------------------------------------
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--train-data",
-        type=Path,
-        required=True,
-        help=(
-            "Path to the MATLAB v7.3 (.mat) file containing the training "
-            "samples (will be split into train/validation)."
-        ),
-    )
-    parser.add_argument(
-        "--test-data",
-        type=Path,
-        required=True,
-        help="Path to the MATLAB v7.3 (.mat) file containing the held-out test set.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("training_outputs"),
-        help="Directory where models, logs and figures will be stored.",
-    )
-    parser.add_argument("--epochs", type=int, default=80, help="Maximum number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=128, help="Mini-batch size.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate.")
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=1e-4,
-        help="Weight decay used by the AdamW optimiser.",
-    )
-    parser.add_argument(
-        "--patience",
-        type=int,
-        default=12,
-        help="Number of epochs with no validation improvement before early stopping.",
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=0,
-        help="Number of worker processes used by the dataloaders.",
-    )
-    parser.add_argument(
-        "--val-ratio",
-        type=float,
-        default=0.1,
-        help="Fraction of the training set used for validation (0 < ratio < 1).",
-    )
-    parser.add_argument(
-        "--feature-key",
-        type=str,
-        default=None,
-        help="Optional dataset key containing the feature tensor.  Leave unset to auto-detect.",
-    )
-    parser.add_argument(
-        "--label-key",
-        type=str,
-        default=None,
-        help="Optional dataset key containing the labels.  Leave unset to auto-detect.",
-    )
-    parser.add_argument(
-        "--test-feature-key",
-        type=str,
-        default=None,
-        help="Optional dataset key containing the test feature tensor.",
-    )
-    parser.add_argument(
-        "--test-label-key",
-        type=str,
-        default=None,
-        help="Optional dataset key containing the test labels.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed used for dataset splitting and weight initialisation.",
-    )
-    return parser.parse_args()
+@dataclass
+class TrainingConfig:
+    """Container holding the full training configuration.
+
+    All hyper-parameters can be tweaked by modifying the dataclass fields below.
+    This avoids the need for command-line arguments and makes experiments fully
+    reproducible from within the script itself.
+    """
+
+    train_data: Path
+    test_data: Path
+    output_dir: Path = Path("training_outputs")
+    epochs: int = 80
+    batch_size: int = 128
+    lr: float = 3e-4
+    min_lr: float = 3e-5
+    weight_decay: float = 5e-5
+    warmup_epochs: int = 5
+    patience: int = 20
+    min_epochs: int = 20
+    early_stop_delta: float = 1e-4
+    num_workers: int = 0
+    val_ratio: float = 0.1
+    feature_key: str | None = None
+    label_key: str | None = None
+    test_feature_key: str | None = None
+    test_label_key: str | None = None
+    seed: int = 42
+    known_class_ratio: float = 0.7
+    openmax_tail_size: int = 20
+    openmax_alpha: int = 3
+    gan_latent_dim: int = 128
+    gan_hidden_dim: int = 1024
+    gan_epochs: int = 80
+    gan_batch_size: int = 128
+    tsne_samples: int = 2000
+
+
+DEFAULT_CONFIG = TrainingConfig(
+    train_data=Path(r"E:\数据集\ADS-B_Train_10X360-2_5-10-15-20dB.mat"),
+    test_data=Path(r"E:\数据集\ADS-B_Test_10X360-2_5-10-15-20dB.mat"),
+)
+
+
+@dataclass
+class PreparedData:
+    train_loader: DataLoader
+    val_loader: DataLoader
+    test_known_loader: DataLoader
+    test_unknown_loader: DataLoader
+    train_dataset: ADSBSignalDataset
+    val_dataset: ADSBSignalDataset
+    open_split: OpenSetSplit
+    unknown_pool_data: np.ndarray
+    unknown_pool_labels: np.ndarray
+    known_train_data: np.ndarray
+    known_train_labels: np.ndarray
 
 
 def set_seed(seed: int) -> None:
@@ -122,44 +103,104 @@ def set_seed(seed: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def create_dataloaders(
-    train_mat_path: Path,
-    *,
-    test_mat_path: Path,
-    val_ratio: float,
-    batch_size: int,
-    num_workers: int,
-    feature_key: str | None,
-    label_key: str | None,
-    test_feature_key: str | None,
-    test_label_key: str | None,
-    seed: int,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
+def prepare_dataloaders(config: TrainingConfig) -> PreparedData:
     train_split, val_split, test_split = create_datasets(
-        train_mat_path,
-        test_mat_path=test_mat_path,
-        val_ratio=val_ratio,
-        feature_key=feature_key,
-        label_key=label_key,
-        test_feature_key=test_feature_key,
-        test_label_key=test_label_key,
-        random_state=seed,
+        config.train_data,
+        test_mat_path=config.test_data,
+        val_ratio=config.val_ratio,
+        feature_key=config.feature_key,
+        label_key=config.label_key,
+        test_feature_key=config.test_feature_key,
+        test_label_key=config.test_label_key,
+        random_state=config.seed,
     )
 
-    train_dataset = ADSBSignalDataset(train_split.data, train_split.labels)
-    val_dataset = ADSBSignalDataset(val_split.data, val_split.labels)
-    test_dataset = ADSBSignalDataset(test_split.data, test_split.labels)
+    open_split = determine_open_set_split(train_split.labels, config.known_class_ratio)
+
+    class_to_index = {cls: idx for idx, cls in enumerate(open_split.known_classes)}
+
+    def remap(labels: np.ndarray) -> np.ndarray:
+        return np.vectorize(class_to_index.__getitem__, otypes=[np.int64])(labels)
+
+    known_train_data, known_train_labels_raw = filter_by_classes(
+        train_split.data, train_split.labels, open_split.known_classes
+    )
+    known_val_data, known_val_labels_raw = filter_by_classes(
+        val_split.data, val_split.labels, open_split.known_classes
+    )
+    known_test_data, known_test_labels_raw = filter_by_classes(
+        test_split.data, test_split.labels, open_split.known_classes
+    )
+
+    known_train_labels = remap(known_train_labels_raw)
+    known_val_labels = remap(known_val_labels_raw)
+    known_test_labels = remap(known_test_labels_raw)
+
+    unknown_train_data, unknown_train_labels = filter_by_classes(
+        train_split.data, train_split.labels, open_split.unknown_classes
+    )
+    unknown_val_data, unknown_val_labels = filter_by_classes(
+        val_split.data, val_split.labels, open_split.unknown_classes
+    )
+    unknown_test_data, unknown_test_labels = filter_by_classes(
+        test_split.data, test_split.labels, open_split.unknown_classes
+    )
+
+    if unknown_test_data.size == 0:
+        raise RuntimeError(
+            "No samples found for the unknown classes. Adjust `known_class_ratio` to keep at least one unknown class."
+        )
+
+    train_dataset = ADSBSignalDataset(known_train_data, known_train_labels)
+    val_dataset = ADSBSignalDataset(known_val_data, known_val_labels)
+    known_test_dataset = ADSBSignalDataset(known_test_data, known_test_labels)
+    unknown_test_dataset = ADSBSignalDataset(unknown_test_data, unknown_test_labels)
 
     loader_kwargs = {
-        "batch_size": batch_size,
-        "num_workers": num_workers,
+        "batch_size": config.batch_size,
+        "num_workers": config.num_workers,
         "pin_memory": torch.cuda.is_available(),
     }
 
     train_loader = DataLoader(train_dataset, shuffle=True, drop_last=False, **loader_kwargs)
     val_loader = DataLoader(val_dataset, shuffle=False, drop_last=False, **loader_kwargs)
-    test_loader = DataLoader(test_dataset, shuffle=False, drop_last=False, **loader_kwargs)
-    return train_loader, val_loader, test_loader
+    known_test_loader = DataLoader(known_test_dataset, shuffle=False, drop_last=False, **loader_kwargs)
+    unknown_test_loader = DataLoader(unknown_test_dataset, shuffle=False, drop_last=False, **loader_kwargs)
+
+    unknown_sources = [
+        arr
+        for arr in [unknown_train_data, unknown_val_data, unknown_test_data]
+        if arr.size > 0
+    ]
+    unknown_label_sources = [
+        arr
+        for arr in [unknown_train_labels, unknown_val_labels, unknown_test_labels]
+        if arr.size > 0
+    ]
+    unknown_pool_data = (
+        np.concatenate(unknown_sources, axis=0)
+        if unknown_sources
+        else np.empty((0,) + train_split.data.shape[1:], dtype=train_split.data.dtype)
+    )
+    unknown_pool_labels = (
+        np.concatenate(unknown_label_sources, axis=0)
+        if unknown_label_sources
+        else np.empty((0,), dtype=train_split.labels.dtype)
+    )
+
+    return PreparedData(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_known_loader=known_test_loader,
+        test_unknown_loader=unknown_test_loader,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        open_split=open_split,
+        unknown_pool_data=unknown_pool_data,
+        unknown_pool_labels=unknown_pool_labels,
+        known_train_data=known_train_data,
+        known_train_labels=known_train_labels,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +277,19 @@ def evaluate(
     return loss_meter.avg, acc_meter.avg, y_true, y_pred
 
 
+def adjust_learning_rate(optimizer: torch.optim.Optimizer, epoch: int, config: TrainingConfig) -> float:
+    if epoch <= config.warmup_epochs:
+        lr = config.lr * epoch / max(1, config.warmup_epochs)
+    else:
+        progress = (epoch - config.warmup_epochs) / max(1, config.epochs - config.warmup_epochs)
+        lr = config.min_lr + 0.5 * (config.lr - config.min_lr) * (1 + math.cos(math.pi * progress))
+
+    lr = max(lr, config.min_lr)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+    return lr
+
+
 # ---------------------------------------------------------------------------
 # Visualisation helpers
 # ---------------------------------------------------------------------------
@@ -273,42 +327,33 @@ def plot_training_curves(history: Dict[str, list], output_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    args = parse_args()
-    set_seed(args.seed)
+def main(config: TrainingConfig = DEFAULT_CONFIG) -> None:
+    set_seed(config.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_loader, val_loader, test_loader = create_dataloaders(
-        args.train_data,
-        test_mat_path=args.test_data,
-        val_ratio=args.val_ratio,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        feature_key=args.feature_key,
-        label_key=args.label_key,
-        test_feature_key=args.test_feature_key,
-        test_label_key=args.test_label_key,
-        seed=args.seed,
-    )
+    prepared = prepare_dataloaders(config)
 
-    num_classes = len(np.unique(train_loader.dataset.labels.cpu().numpy()))
+    train_loader = prepared.train_loader
+    val_loader = prepared.val_loader
+    known_test_loader = prepared.test_known_loader
+    unknown_test_loader = prepared.test_unknown_loader
+
+    num_classes = len(prepared.open_split.known_classes)
     model = create_model("CNN_Transformer", num_classes=num_classes).to(device)
 
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=4, verbose=True
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
     )
     early_stopping = EarlyStopping(
-        patience=args.patience,
+        patience=config.patience,
         verbose=True,
-        path=str(args.output_dir / "best_model.pt"),
+        path=str(config.output_dir / "best_model.pt"),
+        delta=config.early_stop_delta,
     )
 
     history: Dict[str, list] = {
@@ -316,9 +361,11 @@ def main() -> None:
         "val_loss": [],
         "train_acc": [],
         "val_acc": [],
+        "lr": [],
     }
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, config.epochs + 1):
+        current_lr = adjust_learning_rate(optimizer, epoch, config)
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, device
         )
@@ -326,18 +373,21 @@ def main() -> None:
             model, val_loader, criterion, device
         )
 
-        scheduler.step(val_loss)
         early_stopping(val_loss, model)
+        if early_stopping.early_stop and epoch < config.min_epochs:
+            early_stopping.early_stop = False
+            early_stopping.counter = 0
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["train_acc"].append(train_acc)
         history["val_acc"].append(val_acc)
+        history["lr"].append(current_lr)
 
         print(
             f"Epoch {epoch:03d} | "
             f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
-            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} | lr={current_lr:.6f}"
         )
 
         if early_stopping.early_stop:
@@ -345,60 +395,82 @@ def main() -> None:
             break
 
     # Restore the best checkpoint (lowest validation loss).
-    best_model_path = args.output_dir / "best_model.pt"
+    best_model_path = config.output_dir / "best_model.pt"
     if best_model_path.exists():
         model.load_state_dict(torch.load(best_model_path, map_location=device))
 
-    plot_training_curves(history, args.output_dir)
+    plot_training_curves(history, config.output_dir)
 
     # Evaluate on the held-out test set.
-    test_loss, test_acc, y_true, y_pred = evaluate(
-        model, test_loader, criterion, device, collect_predictions=True
+    known_loss, known_acc, y_true_known, y_pred_known = evaluate(
+        model, known_test_loader, criterion, device, collect_predictions=True
     )
-    print(f"Test loss: {test_loss:.4f} | Test accuracy: {test_acc:.4f}")
+    print(f"Known-class test loss: {known_loss:.4f} | Known-class accuracy: {known_acc:.4f}")
 
     # Persist metrics and detailed reports for later inspection.
     metrics = {
         "train_history": history,
-        "test_loss": test_loss,
-        "test_accuracy": test_acc,
+        "known_test_loss": known_loss,
+        "known_test_accuracy": known_acc,
+        "open_set_split": prepared.open_split.as_dict(),
     }
-    with open(args.output_dir / "metrics.json", "w", encoding="utf-8") as fp:
+    with open(config.output_dir / "metrics.json", "w", encoding="utf-8") as fp:
         json.dump(metrics, fp, indent=2)
 
+    class_mapping = prepared.open_split.known_classes
+    target_names = [f"Class {cls}" for cls in class_mapping]
     report = classification_report(
-        y_true,
-        y_pred,
+        y_true_known,
+        y_pred_known,
+        labels=list(range(len(class_mapping))),
+        target_names=target_names,
         digits=4,
         output_dict=True,
         zero_division=0,
     )
-    with open(args.output_dir / "classification_report.json", "w", encoding="utf-8") as fp:
+    with open(config.output_dir / "classification_report.json", "w", encoding="utf-8") as fp:
         json.dump(report, fp, indent=2)
 
-    class_names = [f"Class {idx}" for idx in sorted(np.unique(y_true))]
+    class_names = target_names
     fig = plot_confusion_matrix(
-        y_true,
-        y_pred,
+        y_true_known,
+        y_pred_known,
         class_names=class_names,
         normalize=True,
-        title="Normalised confusion matrix",
-        save_path=args.output_dir / "confusion_matrix.png",
+        title="Normalised confusion matrix (known classes)",
+        save_path=config.output_dir / "confusion_matrix.png",
     )
     plt.close(fig)
 
     # Also store the raw confusion matrix for completeness.
     fig = plot_confusion_matrix(
-        y_true,
-        y_pred,
+        y_true_known,
+        y_pred_known,
         class_names=class_names,
         normalize=False,
-        title="Confusion matrix (counts)",
-        save_path=args.output_dir / "confusion_matrix_counts.png",
+        title="Confusion matrix (counts, known classes)",
+        save_path=config.output_dir / "confusion_matrix_counts.png",
     )
     plt.close(fig)
 
-    print("Training artefacts written to", args.output_dir.resolve())
+    # ----------------------- Open-set evaluation -------------------------
+    run_open_set_pipeline(
+        model,
+        train_loader,
+        known_test_loader,
+        unknown_test_loader,
+        unknown_pool=prepared.unknown_pool_data,
+        num_classes=num_classes,
+        open_split=prepared.open_split,
+        config=config,
+        device=device,
+        output_dir=config.output_dir,
+    )
+
+    print(
+        "Open-set evaluation complete. Metrics saved to",
+        config.output_dir / "open_set_metrics.json",
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover - script entry point
