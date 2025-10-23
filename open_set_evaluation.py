@@ -6,8 +6,10 @@ This module keeps the closed-set training script untouched while providing a
 stand-alone workflow that can be executed after the classifier has been trained
 on all 10 classes.  During open-set evaluation the model is only expected to
 recognise the first seven classes, whereas the remaining three classes act as
-unknown examples.  The script benchmarks a collection of open-set detectors
-including OpenMax and produces quantitative metrics together with visual
+unknown examples.  The script benchmarks a suite of open-set detectors
+including OpenMax, MSP, entropy, energy, logit-margin, Mahalanobis, Gaussian
+NLL, prototype distances, KL-to-uniform, and feature-norm baselines while
+producing quantitative metrics together with visual
 diagnostics saved under ``open_set_outputs/``.
 
 The entry point is :func:`run_open_set_evaluation`, which can be executed
@@ -222,12 +224,24 @@ def _logsumexp(logits: np.ndarray) -> np.ndarray:
     return max_logits + np.log(np.exp(logits - max_logits).sum(axis=1, keepdims=True))
 
 
+def _kl_to_uniform(logits: np.ndarray) -> np.ndarray:
+    probs = _softmax(logits)
+    num_classes = probs.shape[1]
+    uniform = 1.0 / num_classes
+    kl = np.sum(probs * (np.log(probs + 1e-12) - math.log(uniform)), axis=1)
+    return 1.0 / (kl + 1e-6)
+
+
+def _feature_norm(features: np.ndarray) -> np.ndarray:
+    return np.linalg.norm(features, axis=1)
+
+
 def _compute_mahalanobis_stats(
     features: np.ndarray,
     labels: np.ndarray,
     known_classes: Sequence[int],
     epsilon: float = 1e-6,
-) -> Tuple[Dict[int, np.ndarray], np.ndarray]:
+) -> Tuple[Dict[int, np.ndarray], np.ndarray, float]:
     means: Dict[int, np.ndarray] = {}
     centered: List[np.ndarray] = []
 
@@ -243,7 +257,11 @@ def _compute_mahalanobis_stats(
     covariance = np.cov(stacked, rowvar=False, bias=True)
     covariance += epsilon * np.eye(covariance.shape[0], dtype=covariance.dtype)
     precision = np.linalg.inv(covariance)
-    return means, precision
+    sign, logdet = np.linalg.slogdet(covariance)
+    if sign <= 0:
+        # Fall back to an explicit determinant to avoid invalid logarithms.
+        logdet = float(np.log(np.abs(np.linalg.det(covariance)) + 1e-12))
+    return means, precision, float(logdet)
 
 
 def _mahalanobis_distance(
@@ -255,6 +273,40 @@ def _mahalanobis_distance(
     for mean in means.values():
         diff = feature - mean
         distances.append(float(diff @ precision @ diff))
+    return min(distances)
+
+
+def _gaussian_negative_log_likelihood(
+    feature: np.ndarray,
+    means: Dict[int, np.ndarray],
+    precision: np.ndarray,
+    log_det_cov: float,
+) -> float:
+    values = []
+    for mean in means.values():
+        diff = feature - mean
+        mahal = float(diff @ precision @ diff)
+        values.append(0.5 * (mahal + log_det_cov))
+    return min(values)
+
+
+def _cosine_distance(feature: np.ndarray, means: Dict[int, np.ndarray]) -> float:
+    feature_norm = np.linalg.norm(feature)
+    if feature_norm < 1e-12:
+        return 1.0
+    scores = []
+    feature_unit = feature / feature_norm
+    for mean in means.values():
+        mean_norm = np.linalg.norm(mean)
+        if mean_norm < 1e-12:
+            continue
+        cosine = float(np.dot(feature_unit, mean / mean_norm))
+        scores.append(1.0 - cosine)
+    return min(scores) if scores else 1.0
+
+
+def _euclidean_distance(feature: np.ndarray, means: Dict[int, np.ndarray]) -> float:
+    distances = [float(np.linalg.norm(feature - mean)) for mean in means.values()]
     return min(distances)
 
 
@@ -524,12 +576,14 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
     weibull = WeibullCalibrator(tail_size=config.tail_size, alpha=config.alpha)
     weibull.fit(train_features, train_labels_known, config.known_classes)
 
-    class_means, precision = _compute_mahalanobis_stats(
+    class_means, precision, log_det_cov = _compute_mahalanobis_stats(
         train_features, train_labels_known, config.known_classes
     )
 
     known_softmax = _softmax(known_logits)
     unknown_softmax = _softmax(unknown_logits)
+    known_feature_norms = _feature_norm(known_features)
+    unknown_feature_norms = _feature_norm(unknown_features)
 
     # ------------------------------------------------------------------
     # Compute detector scores
@@ -593,6 +647,51 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
         dtype=np.float32,
     )
     _compute_unknown_scores(mahalanobis_known, mahalanobis_unknown, "Mahalanobis")
+
+    # Gaussian NLL
+    gaussian_known = np.array(
+        [
+            _gaussian_negative_log_likelihood(feat, class_means, precision, log_det_cov)
+            for feat in known_features
+        ],
+        dtype=np.float32,
+    )
+    gaussian_unknown = np.array(
+        [
+            _gaussian_negative_log_likelihood(feat, class_means, precision, log_det_cov)
+            for feat in unknown_features
+        ],
+        dtype=np.float32,
+    )
+    _compute_unknown_scores(gaussian_known, gaussian_unknown, "Gaussian NLL")
+
+    # Euclidean distance to class prototypes
+    euclidean_known = np.array(
+        [_euclidean_distance(feat, class_means) for feat in known_features], dtype=np.float32
+    )
+    euclidean_unknown = np.array(
+        [_euclidean_distance(feat, class_means) for feat in unknown_features], dtype=np.float32
+    )
+    _compute_unknown_scores(euclidean_known, euclidean_unknown, "Euclidean distance")
+
+    # Cosine distance to class prototypes
+    cosine_known = np.array(
+        [_cosine_distance(feat, class_means) for feat in known_features], dtype=np.float32
+    )
+    cosine_unknown = np.array(
+        [_cosine_distance(feat, class_means) for feat in unknown_features], dtype=np.float32
+    )
+    _compute_unknown_scores(cosine_known, cosine_unknown, "Cosine distance")
+
+    # KL divergence to uniform distribution (lower divergence -> more unknown)
+    kl_known = _kl_to_uniform(known_logits)
+    kl_unknown = _kl_to_uniform(unknown_logits)
+    _compute_unknown_scores(kl_known, kl_unknown, "KL to uniform")
+
+    # Feature norm (smaller norms often correlate with unknowns)
+    norm_known = 1.0 / (known_feature_norms + 1e-6)
+    norm_unknown = 1.0 / (unknown_feature_norms + 1e-6)
+    _compute_unknown_scores(norm_known, norm_unknown, "Inverse feature norm")
 
     # OpenMax
     openmax_known = []
