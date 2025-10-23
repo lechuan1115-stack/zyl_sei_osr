@@ -1,279 +1,261 @@
-#!/usr/bin/env python 
+#!/usr/bin/env python
 # -*- coding:utf-8 -*-
-import numpy as np
-from torch.utils.data import Dataset
-import h5py
-#原始文件中是在datasets.py中读取数据的，分别读取测试集和训练集
-import random
+"""Data loading utilities for the ADS-B modulation recognition project.
+
+The previous version of this module contained numerous legacy helpers that
+were specific to old experiments.  The implementation below focuses on the
+10-class ADS-B dataset stored in MATLAB v7.3 (HDF5) ``.mat`` files.  Each
+sample is an I/Q complex time-series with the layout ``(4800, 2)``.  The
+helpers centralise the logic required to read the dataset, normalise the
+shape to PyTorch's channel-first convention and split the data into
+train/validation/test partitions.
+"""
+
+from __future__ import annotations
+
 import json
 import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple
 
-def _check_path(p):
-    full = os.path.abspath(p)
-    print(f"[DATA] trying to read: {full}")
-    if not os.path.exists(full):
-        raise FileNotFoundError(f"File not found: {full}")
-    return full
+import h5py
+import numpy as np
+from sklearn.model_selection import train_test_split
+import torch
+from torch.utils.data import Dataset
+
+__all__ = [
+    "ADSBSignalDataset",
+    "DatasetSplit",
+    "create_datasets",
+    "load_adsb_dataset",
+]
 
 
+@dataclass(frozen=True)
+class DatasetSplit:
+    """Container returning NumPy arrays for a single dataset split."""
 
-def load_h4(h5_path):
-    # load training data  读取数据并处理
-    h5_path = _check_path(h5_path)
-    with h5py.File(h5_path, 'r') as hf:
-        head = list(hf.keys())
-        # print('List of arrays in input file:', hf.keys())
-        X = np.transpose(np.array(hf.get(head[0]), dtype=np.float32))
-        Y = np.transpose(np.array(hf.get(head[1]), dtype=np.float32))
-        if X.ndim == 3:
-            X1 = X.swapaxes(1, 2) # 将数组n个维度中两个维度进行调换
-            # X1 = X
-            Y1 = Y.astype(np.float32)
-        elif Y.ndim == 3:
-            X1 = Y.swapaxes(1, 2)  # 将数组n个维度中两个维度进行调换
-            # X1 = X
-            Y1 = X.astype(np.float32)
+    data: np.ndarray
+    labels: np.ndarray
+
+
+class ADSBSignalDataset(Dataset):
+    """PyTorch ``Dataset`` wrapping ADS-B I/Q samples.
+
+    Parameters
+    ----------
+    data:
+        NumPy array with shape ``(N, 2, 4800)`` containing the I and Q channels
+        in the second dimension.
+    labels:
+        Integer encoded labels with shape ``(N,)``.  The helper function
+        :func:`load_adsb_dataset` already converts MATLAB's one-based labels to
+        zero-based indices.
+    """
+
+    def __init__(self, data: np.ndarray, labels: np.ndarray) -> None:
+        if data.ndim != 3 or data.shape[1] != 2:
+            raise ValueError(
+                "`data` must have shape (num_samples, 2, signal_length). "
+                f"Got {data.shape}."
+            )
+        if labels.ndim != 1:
+            raise ValueError("`labels` must be a one-dimensional array.")
+
+        self.data = torch.from_numpy(data.astype(np.float32, copy=False))
+        self.labels = torch.from_numpy(labels.astype(np.int64, copy=False))
+
+    def __getitem__(self, index: int):
+        return self.data[index], self.labels[index]
+
+    def __len__(self) -> int:  # pragma: no cover - trivial
+        return int(self.data.shape[0])
+
+
+def load_adsb_dataset(
+    mat_path: os.PathLike[str] | str,
+    *,
+    feature_key: Optional[str] = None,
+    label_key: Optional[str] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Load the ADS-B dataset stored inside a MATLAB v7.3 ``.mat`` file.
+
+    The function tries to infer the dataset keys automatically.  When a custom
+    layout is used, set ``feature_key`` and ``label_key`` explicitly.  The
+    returned data is shaped as ``(num_samples, 2, 4800)`` using the channel-first
+    convention expected by :class:`torch.nn.Conv1d`.
+    """
+
+    mat_path = Path(mat_path)
+    if not mat_path.exists():
+        raise FileNotFoundError(f"Dataset file not found: {mat_path}")
+
+    with h5py.File(mat_path, "r") as mat_file:
+        keys = list(mat_file.keys())
+        if len(keys) < 2 and not (feature_key and label_key):
+            raise RuntimeError(
+                "The .mat file must contain at least two datasets (features and "
+                "labels)."
+            )
+
+        # ``feature_key``/``label_key`` override the automatic detection.  When
+        # not provided we heuristically pick the array with the highest number of
+        # dimensions as the feature tensor and the remaining one as labels.
+        if feature_key is None or label_key is None:
+            arrays = {k: np.array(mat_file[k]) for k in keys}
+            if feature_key is None:
+                feature_key = max(arrays, key=lambda k: arrays[k].ndim)
+            if label_key is None:
+                remaining = [k for k in arrays if k != feature_key]
+                if not remaining:
+                    raise RuntimeError("Unable to infer label dataset from file.")
+                # Prefer the array with the smallest dimensionality for labels.
+                label_key = min(remaining, key=lambda k: arrays[k].ndim)
+            features = arrays[feature_key]
+            labels = arrays[label_key]
         else:
-            raise RuntimeError("维度错误")
+            features = np.array(mat_file[feature_key])
+            labels = np.array(mat_file[label_key])
 
-        X1 = np.expand_dims(X1, axis=0)
-        X1 = X1.swapaxes(0, 1)
-        X1 = X1.swapaxes(1, 2)
-        Y1 = Y
+    data = _ensure_channel_first(features)
+    labels = _prepare_labels(labels)
 
-        index = [i for i in range(len(Y1))]
-        # random.seed(10)
-        random.shuffle(index)
-        data = X1[index,:,:]
-        label = Y1[index]
-        # print("打乱数据集",data.shape)
-        # print("打乱数据集",label.shape)
-        # print("打乱数据集",label[:6])
-        txdata4 = {
-            "str": "读取文件：" +  str(hf.keys())
-        }
-        json_string4 = json.dumps(txdata4, ensure_ascii=False)
-        print(json_string4)
-        txdata4 = {
-            "str": "打乱数据集：" + str(data.shape)
-        }
-        json_string4 = json.dumps(txdata4, ensure_ascii=False)
-        print(json_string4)
-        txdata4 = {
-            "str": "打乱标签：" + str(label.shape)
-        }
-        json_string4 = json.dumps(txdata4, ensure_ascii=False)
-        print(json_string4)
-    return data, label
-def load_h5(h5_path):
-    # load training data  读取数据并处理
-    h5_path = _check_path(h5_path)
-    with h5py.File(h5_path, 'r') as hf:
-        head = list(hf.keys())
-        # print('List of arrays in input file:', hf.keys())
-        X = np.transpose(np.array(hf.get(head[0]), dtype=np.float32))
-        Y = np.transpose(np.array(hf.get(head[1]), dtype=np.float32))
-        if X.ndim == 3:
-            X1 = X.swapaxes(1, 2) # 将数组n个维度中两个维度进行调换
-            # X1 = X
-            Y1 = Y.astype(np.float32)
-        elif Y.ndim == 3:
-            X1 = Y.swapaxes(1, 2)  # 将数组n个维度中两个维度进行调换
-            # X1 = X
-            Y1 = X.astype(np.float32)
-        else:
-            raise RuntimeError("维度错误")
+    if data.shape[0] != labels.shape[0]:
+        raise RuntimeError(
+            "Mismatched number of samples: "
+            f"features={data.shape[0]} vs labels={labels.shape[0]}"
+        )
 
-        index = [i for i in range(len(Y1))]
-        # random.seed(10)
-        random.shuffle(index)
-        data = X1[index,:,:]
-        label = Y1[index]
-        # print("打乱数据集",data.shape)
-        # print("打乱数据集",label.shape)
-        # print("打乱数据集",label[:6])
-        txdata5 = {
-            "str": "读取文件：" + str(hf.keys())
-        }
-        json_string5 = json.dumps(txdata5, ensure_ascii=False)
-        print(json_string5)
-        txdata5 = {
-            "str": "打乱数据集：" + str(data.shape)
-        }
-        json_string5 = json.dumps(txdata5, ensure_ascii=False)
-        print(json_string5)
-        txdata5 = {
-            "str": "打乱标签：" + str(label.shape)
-        }
-        json_string5 = json.dumps(txdata5, ensure_ascii=False)
-        print(json_string5)
-    return data, label
-
-def load_h6(h5_path):
-    # load training data  读取数据并处理
-    h5_path = _check_path(h5_path)
-    with h5py.File(h5_path, 'r') as hf:
-        head = list(hf.keys())
-        print('List of arrays in input file:', hf.keys())
-        X = np.transpose(np.array(hf.get(head[0]), dtype=np.float32))
-        Y = np.transpose(np.array(hf.get(head[1]), dtype=np.float32))
-        if X.ndim == 3:
-            X1 = X.swapaxes(1, 2) # 将数组n个维度中两个维度进行调换
-            Y1 = Y.astype(np.float32)
-        elif Y.ndim == 3:
-            X1 = Y.swapaxes(1, 2)  # 将数组n个维度中两个维度进行调换
-            Y1 = X.astype(np.float32)
-        else:
-            raise RuntimeError("维度错误")
-        m = 800
-        # list = range(1000)
-        import random
-        # print()  random.sample(list,m)
-        Empty = np.zeros([ m*100 ,2 , 2196], dtype=np.float32)
-        Empty_y = np.zeros([m*100, 1], dtype=np.float32)
-        for n in range(100):
-            # X = X1[1000*n+random.sample(list,m),:,:]
-            # for j in range(m):
-            # Empty[m*n:m-1+m*n,:,:] = X1.take(1000*n+random.sample(list,m))
-            # Empty_y[m*n:m-1+m*n] = Y1.take(1000*n+random.sample(list,m))
-            Empty[m*n:m-1+m*n,:,:] = X1[1000*n:m-1+1000*n,:,:]
-            Empty_y[m*n:m-1+m*n] = Y1[1000*n:m-1+1000*n]
-        index = [i for i in range(len(Empty_y))]
-        random.shuffle(index)
-        data = Empty[index,:,:]
-        label = Empty_y[index]
-        print("打乱数据集",data.shape)
-        print("打乱数据集",label.shape)
-    return data, label
-
-class SignalDataset(Dataset):
-    """数据加载器  返回指定数目的数据"""
-    def __init__(self, data_folder, transform=None):
-        self.data_folder = data_folder
-        self.transform = transform
-        self.X, self.Y = load_h6(data_folder)   # (3392, 8192, 1)
-
-    def __getitem__(self, item):
-        # 返回一个音频数据
-        X = self.X[item]
-        Y = self.Y[item]
-        return X, Y
-    def __len__(self):
-        return len(self.X)
+    _log_dataset_statistics(mat_path, data, labels, feature_key, label_key)
+    return data, labels
 
 
-def load_h5_2D(h5_path):
-    h5_path = _check_path(h5_path)
-    # load training data  读取数据并处理
-    with h5py.File(h5_path, 'r') as hf:
-        head = list(hf.keys())
-        print('List of arrays in input file:', hf.keys())
-        X = np.transpose(np.array(hf.get(head[0]), dtype=np.float32))
-        Y = np.transpose(np.array(hf.get(head[1]), dtype=np.float32))
-        if X.ndim == 3:
-            X1 = X.swapaxes(1, 2) # 将数组n个维度中两个维度进行调换
-            X1 = X1[:, :, np.newaxis, :]
-            Y1 = Y.astype(np.float32)
-        elif Y.ndim == 3:
-            X1 = Y.swapaxes(1, 2)  # 将数组n个维度中两个维度进行调换
-            X1 = X1[:, :, np.newaxis, :]
-            Y1 = X.astype(np.float32)
-        else:
-            raise RuntimeError("维度错误")
+def create_datasets(
+    train_mat_path: os.PathLike[str] | str,
+    *,
+    test_mat_path: os.PathLike[str] | str,
+    val_ratio: float = 0.1,
+    random_state: int = 42,
+    feature_key: Optional[str] = None,
+    label_key: Optional[str] = None,
+    test_feature_key: Optional[str] = None,
+    test_label_key: Optional[str] = None,
+) -> Tuple[DatasetSplit, DatasetSplit, DatasetSplit]:
+    """Create train/validation/test splits from dedicated dataset files.
 
-        index = [i for i in range(len(Y1))]
-        # random.seed(10)
-        random.shuffle(index)
-        data = X1[index,:,:,:]
-        label = Y1[index]
-        print("打乱数据集",data.shape)
-        print("打乱数据集",label.shape)
-        # print("打乱数据集",label[:6])
-    return X1, Y1
+    Parameters
+    ----------
+    train_mat_path:
+        Path to the MATLAB ``.mat`` file containing the combined training
+        samples.  The function will internally split this data into training and
+        validation subsets using ``val_ratio``.
+    test_mat_path:
+        Path to the MATLAB ``.mat`` file containing the held-out test set.
+    val_ratio:
+        Fraction of the training samples used for validation.  The remainder is
+        used for training.
+    random_state:
+        Seed controlling the deterministic behaviour of ``train_test_split``.
+    feature_key / label_key:
+        Optional overrides selecting the arrays that contain the raw signals and
+        the labels inside the MATLAB file.  When unset the function will attempt
+        to infer them automatically.  ``test_feature_key`` and ``test_label_key``
+        provide the same overrides for the test dataset (falling back to the
+        training keys when omitted).
+    """
 
-class SignalDataset1(Dataset):
-    """数据加载器"""
-    def __init__(self, data_folder, transform=None):
-        self.data_folder = data_folder
-        self.transform = transform
-        self.X, self.Y = load_h4(data_folder)   # (3392, 8192, 1)
-        # self.X, self.Y = load_h5(data_folder)  # (3392, 8192, 1)
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError("`val_ratio` must be between 0 and 1 (exclusive).")
 
-    def __getitem__(self, item):
-        # 返回一个音频数据
-        X = self.X[item]
-        Y = self.Y[item]
-        return X, Y
-    def __len__(self):
-        return len(self.X)
+    data, labels = load_adsb_dataset(
+        train_mat_path,
+        feature_key=feature_key,
+        label_key=label_key,
+    )
 
-class SignalDataset2(Dataset):
-    """数据加载器"""
-    def __init__(self, data_folder, transform=None):
-        self.data_folder = data_folder
-        self.transform = transform
-        self.X, self.Y = load_h5(data_folder)  # (3392, 8192, 1)
+    stratify = labels if len(np.unique(labels)) > 1 else None
+    data_train, data_val, label_train, label_val = train_test_split(
+        data,
+        labels,
+        test_size=val_ratio,
+        random_state=random_state,
+        stratify=stratify,
+    )
 
-    def __getitem__(self, item):
-        # 返回一个音频数据
-        X = self.X[item]
-        Y = self.Y[item]
-        return X, Y
-    def __len__(self):
-        return len(self.X)
-class SignalDataset2D(Dataset):
-    """数据加载器"""
-    def __init__(self, data_folder, transform=None):
-        self.data_folder = data_folder
-        self.transform = transform
-        self.X, self.Y = load_h5_2D(data_folder)   # (3392, 8192, 1)
-    def __getitem__(self, item):
-        X = self.X[item]
-        Y = self.Y[item]
-        return X, Y
-    def __len__(self):
-        return len(self.X)
+    test_data, test_labels = load_adsb_dataset(
+        test_mat_path,
+        feature_key=test_feature_key or feature_key,
+        label_key=test_label_key or label_key,
+    )
 
-if __name__ == '__main__':
-    import matplotlib.pyplot as plt
+    return (
+        DatasetSplit(data_train, label_train),
+        DatasetSplit(data_val, label_val),
+        DatasetSplit(test_data, test_labels),
+    )
 
-    X, Y = load_h6('Case0_7.68M/Case0_7.68M_TX_100X1000_15dB_2196_withoutCFO.mat')
-    print(Y[90:110])
-    # X, Y = load_h5('Case0_7.68M_LOS_20dB.mat')  #(3845, 2, 4800)
-    # # 信号长度变化
-    # # len1 = np.random.randint(2400,4800)
-    # # data1 = np.zeros([X.shape[0], X.shape[1], X.shape[2]])
-    # #
-    # # x_resampled = signal.resample(X[1,1,:], len1) # 函数使用FFT将信号重采样成n个点
-    # # print(x_resampled.shape)
-    # # 求取FFT
-    # print(X.shape)
-    # fig = plt.figure()
-    # plt.subplot(4,1,1)
-    # plt.plot(X[2,0,:],label="I")
-    # plt.legend()
-    # plt.subplot(4, 1, 2)
-    # plt.plot(X[2,1,:],label="Q")
-    # plt.legend()
-    # plt.subplot(4, 1, 3)
-    # plt.plot(X[2,2,:],label="FFT_I_abs")
-    # plt.legend()
-    # plt.subplot(4, 1, 4)
-    # plt.plot(X[2,3,:],label="FFT_I_angle")
-    # plt.legend()
-    #
-    # fig = plt.figure()
-    # plt.subplot(4,1,1)
-    # plt.plot(X[999,0,:],label="I")
-    # plt.legend()
-    # plt.subplot(4, 1, 2)
-    # plt.plot(X[999,1,:],label="Q")
-    # plt.legend()
-    # plt.subplot(4, 1, 3)
-    # plt.plot(X[999,2,:],label="FFT_I_abs")
-    # plt.legend()
-    # plt.subplot(4, 1, 4)
-    # plt.plot(X[999,3,:],label="FFT_I_angle")
-    # plt.legend()
-    #
-    # plt.show()
+
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
+
+def _ensure_channel_first(array: np.ndarray) -> np.ndarray:
+    """Rearrange the ``.mat`` feature tensor to ``(N, 2, 4800)`` format."""
+
+    array = np.asarray(array)
+    if array.ndim != 3:
+        raise RuntimeError(
+            "Expected a 3-D tensor containing (samples, channels, length). "
+            f"Got {array.shape}."
+        )
+
+    axes = list(range(3))
+    try:
+        channel_axis = next(ax for ax, size in enumerate(array.shape) if size == 2)
+        length_axis = next(ax for ax, size in enumerate(array.shape) if size == 4800)
+    except StopIteration as exc:  # pragma: no cover - defensive programming
+        raise RuntimeError(
+            "Unable to locate channel/length dimensions in feature array."
+        ) from exc
+
+    sample_axis = next(ax for ax in axes if ax not in (channel_axis, length_axis))
+    ordered = np.transpose(array, (sample_axis, channel_axis, length_axis))
+    return ordered.astype(np.float32, copy=False)
+
+
+def _prepare_labels(array: np.ndarray) -> np.ndarray:
+    """Convert labels to a flat array of zero-based ``int64`` indices."""
+
+    labels = np.asarray(array)
+    labels = labels.squeeze()
+    if labels.ndim != 1:
+        raise RuntimeError("Labels must reduce to a one-dimensional array.")
+
+    labels = labels.astype(np.int64)
+    min_label = labels.min()
+    if min_label == 1:
+        # MATLAB-style one-based labels.  Shift to zero-based for PyTorch.
+        labels -= 1
+    return labels
+
+
+def _log_dataset_statistics(
+    mat_path: Path,
+    data: np.ndarray,
+    labels: np.ndarray,
+    feature_key: Optional[str],
+    label_key: Optional[str],
+) -> None:
+    """Print a short JSON-formatted summary for transparency."""
+
+    info = {
+        "file": str(mat_path.resolve()),
+        "feature_key": feature_key,
+        "label_key": label_key,
+        "num_samples": int(data.shape[0]),
+        "signal_shape": list(map(int, data.shape[1:])),
+        "num_classes": int(len(np.unique(labels))),
+    }
+    print(json.dumps(info, ensure_ascii=False))
