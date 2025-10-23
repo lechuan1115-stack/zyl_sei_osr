@@ -1,58 +1,80 @@
-from sklearn.metrics import confusion_matrix
+"""Utility function for drawing confusion matrices."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Iterable, Optional
+
 import matplotlib.pyplot as plt
-import itertools
 import numpy as np
-# TODO 好使的部分  针对100个类别的混淆矩阵
-def plot_confusion_matrix(true_data, pre_data, path,SNR,
-                          normalize=False,
-                          title=None,
-                          cmap=plt.cm.Reds):
+from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
+
+__all__ = ["plot_confusion_matrix"]
+
+
+def plot_confusion_matrix(
+    y_true: Iterable[int],
+    y_pred: Iterable[int],
+    *,
+    class_names: Optional[Iterable[str]] = None,
+    normalize: bool = True,
+    title: str = "Confusion matrix",
+    save_path: Optional[Path | str] = None,
+) -> plt.Figure:
+    """Render a confusion matrix with optional normalisation.
+
+    Parameters
+    ----------
+    y_true, y_pred:
+        Iterables containing the ground-truth and predicted labels.
+    class_names:
+        Optional sequence providing human readable class names.  When omitted
+        the class indices are used directly.
+    normalize:
+        Normalise the confusion matrix row-wise when ``True``.  This highlights
+        per-class accuracy and is often easier to interpret when the dataset is
+        imbalanced.
+    title:
+        Title displayed at the top of the plot.
+    save_path:
+        When provided, the figure is stored as a PNG file at the given path.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The generated figure so callers can further customise or embed it in
+        reports.
     """
-    This function prints and plots the confusion matrix.
-    Normalization can be applied by setting `normalize=True`.
-    """
-    fig = plt.figure()#  dpi=150
-    cm = confusion_matrix(true_data, pre_data)
-    if title is not None:
-        plt.title(title)
-    tick_marks = np.arange(len(set(true_data)))# 设置课标 自适应的
-    if len(set(true_data))<31:
-        plt.xticks(tick_marks, fontsize=16, rotation=90)#
-        plt.yticks(tick_marks, fontsize=16)
-    elif len(set(true_data))<60&len(set(true_data))>31:
-        # print("1111")
-        plt.xticks(tick_marks, fontsize=13, rotation=90)#
-        plt.yticks(tick_marks, fontsize=13)
-    elif len(set(true_data))>90:
-        # print("1111")
-        plt.xticks(tick_marks, fontsize=5.5, rotation=90)#
-        plt.yticks(tick_marks, fontsize=5.7)
+
+    y_true = np.asarray(list(y_true))
+    y_pred = np.asarray(list(y_pred))
+
+    if class_names is None:
+        labels = np.sort(np.unique(np.concatenate((y_true, y_pred))))
+        display_labels = labels
     else:
-        plt.xticks(tick_marks, fontsize=10, rotation=90)#
-        plt.yticks(tick_marks, fontsize=10)
+        display_labels = list(class_names)
+        labels = np.arange(len(display_labels))
+
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
 
     if normalize:
-        cm2 = np.array(cm,dtype=np.float32)
-        num = np.sum(cm2, axis=1)
-        for i in range(cm.shape[0]):
-            for j in range(cm.shape[1]):
-                cm2[i][j] = 1.0 * cm2[i][j] / num[i]
-                cm2[i][j] = round(float(cm2[i][j]), 3)
-        plot = plt.imshow(cm2, cmap=cmap, vmin=0, vmax=1)
-        plt.colorbar(plot)
-    else:
-        plt.imshow(cm, interpolation='nearest', cmap=cmap)
-        print('Confusion matrix, without normalization')
-        plt.colorbar()
-    plt.ylabel('True label', fontsize=20,labelpad=12.5)#
-    plt.xlabel('Predicted label',fontsize=20,labelpad=12.5)# ,labelpad=12.5
-    cm1 = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-    dig = np.diag(cm1)
-    acc = dig.mean()
-    acc = format(acc, '.4%')
-    print("Mean accuracy:", acc)
-    plt.show()
-    if normalize:
-        fig.savefig(path+'Confusion_matrix_'+ str(SNR) + 'dB_' + str(acc) + '.svg')
-    else:
-        fig.savefig(path + 'Confusion_matrix_without normalization_' + str(SNR) + 'dB_'+ str(acc) + '.svg')
+        with np.errstate(all="ignore"):
+            cm = cm.astype(np.float32)
+            row_sums = cm.sum(axis=1, keepdims=True)
+            cm = np.divide(cm, row_sums, out=np.zeros_like(cm), where=row_sums != 0)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    display = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=display_labels)
+    cmap = plt.cm.Blues
+    display.plot(ax=ax, cmap=cmap, values_format=".2f" if normalize else "d", colorbar=True)
+    ax.set_title(title)
+    ax.set_xlabel("Predicted label")
+    ax.set_ylabel("True label")
+    fig.tight_layout()
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=300)
+    return fig
