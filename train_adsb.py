@@ -9,7 +9,7 @@ import json
 import math
 import random
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,7 +19,7 @@ from sklearn.metrics import classification_report
 from torch.utils.data import DataLoader
 
 from Confusion_matrix import plot_confusion_matrix
-from mydata_read import ADSBSignalDataset, create_datasets
+from mydata_read import ADSBSignalDataset, DatasetSplit, create_datasets
 from mymodel1 import create as create_model
 from pytorchtools import EarlyStopping
 from utils import AverageMeter
@@ -57,6 +57,7 @@ class TrainingConfig:
     test_feature_key: str | None = None
     test_label_key: str | None = None
     seed: int = 42
+    known_classes: Sequence[int] = tuple(range(7))
 
 
 DEFAULT_CONFIG = TrainingConfig(
@@ -98,6 +99,32 @@ def prepare_dataloaders(config: TrainingConfig) -> PreparedData:
         test_label_key=config.test_label_key,
         random_state=config.seed,
     )
+
+    def _filter_split(
+        split: DatasetSplit, known_classes: Sequence[int], name: str
+    ) -> DatasetSplit:
+        mask = np.isin(split.labels, known_classes)
+        if not np.any(mask):
+            raise RuntimeError(
+                f"Split '{name}' does not contain any of the requested known classes: {known_classes}"
+            )
+
+        filtered_data = split.data[mask]
+        filtered_labels = split.labels[mask]
+
+        present_classes = np.unique(filtered_labels)
+        missing_classes = sorted(set(known_classes) - set(int(cls) for cls in present_classes))
+        if missing_classes:
+            print(
+                f"Warning: classes {missing_classes} are absent from the {name} split after filtering."
+            )
+
+        return DatasetSplit(filtered_data, filtered_labels)
+
+    known_classes = tuple(sorted(config.known_classes))
+    train_split = _filter_split(train_split, known_classes, "training")
+    val_split = _filter_split(val_split, known_classes, "validation")
+    test_split = _filter_split(test_split, known_classes, "test")
 
     train_dataset = ADSBSignalDataset(train_split.data, train_split.labels)
     val_dataset = ADSBSignalDataset(val_split.data, val_split.labels)
