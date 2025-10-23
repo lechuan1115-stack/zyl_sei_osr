@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 
 from Confusion_matrix import plot_confusion_matrix
 from mydata_read import ADSBSignalDataset, create_datasets
-from mymodel1 import create as create_model
+from mymodel1 import CNN_Transformer
 from pytorchtools import EarlyStopping
 from torch.nn.utils import clip_grad_norm_
 from utils import AverageMeter
@@ -44,16 +44,16 @@ class TrainingConfig:
     train_data: Path = Path(r"E:\数据集\ADS-B_Train_10X360-2_5-10-15-20dB.mat")
     test_data: Path = Path(r"E:\数据集\ADS-B_Test_10X360-2_5-10-15-20dB.mat")
     output_dir: Path = Path("training_outputs")
-    epochs: int = 150
+    epochs: int = 180
     batch_size: int = 128
-    lr: float = 1.2e-3
-    min_lr: float = 1e-5
-    weight_decay: float = 1e-4
-    warmup_epochs: int = 5
-    patience: int = 35
-    min_epochs: int = 45
-    early_stop_delta: float = 1e-4
-    max_grad_norm: float = 3.0
+    lr: float = 8e-4
+    min_lr: float = 5e-5
+    weight_decay: float = 5e-5
+    warmup_epochs: int = 12
+    patience: int = 60
+    min_epochs: int = 70
+    early_stop_delta: float = 5e-5
+    max_grad_norm: float = 2.0
     num_workers: int = 0
     val_ratio: float = 0.1
     feature_key: str | None = None
@@ -62,7 +62,7 @@ class TrainingConfig:
     test_label_key: str | None = None
     seed: int = 42
     log_interval: int = 50
-    label_smoothing: float = 0.05
+    label_smoothing: float = 0.03
 
     def __post_init__(self) -> None:
         # Allow users to provide string paths in custom configurations.
@@ -570,7 +570,7 @@ def main() -> None:
     ]
 
     num_classes = len(np.unique(train_loader.dataset.labels.cpu().numpy()))
-    model = create_model("CNN_Transformer", num_classes=num_classes).to(device)
+    model = CNN_Transformer(num_classes=num_classes).to(device)
 
     criterion = torch.nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
     optimizer = torch.optim.AdamW(

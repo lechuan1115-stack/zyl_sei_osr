@@ -2,12 +2,11 @@
 # -*- coding:utf-8 -*-
 """Model definitions used by the ADS-B classification training script.
 
-Only the ``CNN_Transformer`` architecture is kept because it delivers the
-best performance on the considered I/Q modulation recognition task.  The
-previous repository version shipped with several historical CNN variants
-that were no longer referenced anywhere in the code base.  Removing them
-reduces the maintenance surface and makes it clear which model should be
-used.
+Only the :class:`CNN_Transformer` architecture is retained because it offers
+the best trade-off between capacity and generalisation on the 10-class ADS-B
+dataset.  Earlier revisions bundled multiple legacy CNN variants that were no
+longer exercised anywhere in the code base; removing them reduces the
+maintenance surface and keeps the modelling story unambiguous.
 """
 
 from __future__ import annotations
@@ -15,23 +14,22 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-__all__ = ["CNN_Transformer", "create"]
+__all__ = ["CNN_Transformer"]
 
 
 class CNN_Transformer(nn.Module):
     """Compact CNN + Transformer network tailored for 10-way ADS-B recognition.
 
-    Compared to the previous revision this version drastically reduces the
-    channel counts and the Transformer dimensionality.  The lighter footprint
-    helps curb overfitting while still capturing both local temporal patterns
-    (via convolutions) and long-range dependencies (via a Transformer encoder).
+    The architecture intentionally keeps the channel counts and Transformer
+    dimensionality modest (ending at 192 hidden units) to match the 10-class
+    objective and reduce overfitting risk.  Convolutions learn local temporal
+    patterns, while the Transformer encoder captures long-range dependencies.
 
     Parameters
     ----------
     num_cls:
-        Number of output classes.  The ADS-B dataset contains 10 distinct
-        signal categories so ``num_cls`` defaults to 10, but the value can be
-        overridden for reuse in other experiments.
+        Number of output classes.  Defaults to 10 for the ADS-B dataset but can
+        be overridden for other experiments.
     """
 
     def __init__(self, num_cls: int = 10) -> None:
@@ -41,37 +39,37 @@ class CNN_Transformer(nn.Module):
         # activations.  Pooling every block halves the temporal resolution so
         # the subsequent Transformer processes a shorter sequence.
         self.features = nn.Sequential(
-            nn.Conv1d(2, 32, kernel_size=11, padding=5, bias=False),
-            nn.BatchNorm1d(32),
+            nn.Conv1d(2, 24, kernel_size=11, padding=5, bias=False),
+            nn.BatchNorm1d(24),
             nn.GELU(),
             nn.MaxPool1d(2),
             nn.Dropout(0.1),
 
-            nn.Conv1d(32, 64, kernel_size=7, padding=3, bias=False),
-            nn.BatchNorm1d(64),
+            nn.Conv1d(24, 48, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm1d(48),
             nn.GELU(),
             nn.MaxPool1d(2),
             nn.Dropout(0.1),
 
-            nn.Conv1d(64, 128, kernel_size=5, padding=2, bias=False),
-            nn.BatchNorm1d(128),
+            nn.Conv1d(48, 96, kernel_size=5, padding=2, bias=False),
+            nn.BatchNorm1d(96),
             nn.GELU(),
             nn.MaxPool1d(2),
 
-            nn.Conv1d(128, 192, kernel_size=3, padding=1, bias=False),
+            nn.Conv1d(96, 144, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(144),
+            nn.GELU(),
+            nn.MaxPool1d(2),
+
+            nn.Conv1d(144, 192, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm1d(192),
-            nn.GELU(),
-            nn.MaxPool1d(2),
-
-            nn.Conv1d(192, 256, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(256),
             nn.GELU(),
         )
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=256,
-            nhead=4,
-            dim_feedforward=512,
+            d_model=192,
+            nhead=3,
+            dim_feedforward=384,
             dropout=0.2,
             activation="gelu",
             batch_first=False,
@@ -79,13 +77,13 @@ class CNN_Transformer(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer,
             num_layers=2,
-            norm=nn.LayerNorm(256),
+            norm=nn.LayerNorm(192),
         )
 
         self.classifier = nn.Sequential(
-            nn.LayerNorm(256),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_cls),
+            nn.LayerNorm(192),
+            nn.Dropout(0.25),
+            nn.Linear(192, num_cls),
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -123,17 +121,6 @@ class CNN_Transformer(nn.Module):
         return logits, features
 
 
-__factory = {
-    "CNN_Transformer": CNN_Transformer,
-}
-
-
-def create(name: str, num_classes: int) -> CNN_Transformer:
-    """Instantiate a registered model by name."""
-
-    if name not in __factory:
-        raise KeyError(f"Unknown model: {name}")
-    return __factory[name](num_classes)
 # -*- coding:utf-8 -*-
 import torch.nn as nn
 import torch

@@ -28,16 +28,18 @@ include:
 
 - `train_data` / `test_data`: Absolute or relative paths to the MATLAB files.
 - `epochs`, `warmup_epochs`, `min_epochs`: Control the total training duration,
-  the length of the linear warm-up and the minimum number of epochs to run
-  before early stopping is allowed to trigger.
+  the length of the linear warm-up (12 epochs by default) and the minimum
+  number of epochs to run (70) before early stopping is allowed to trigger.
 - `lr` / `min_lr`: Define the cosine learning-rate schedule that decays from the
-  peak learning rate (`lr`) towards the floor (`min_lr`).
+  peak learning rate (`8e-4`) towards the floor (`5e-5`).
 - `batch_size`, `weight_decay`, `max_grad_norm`: Batch configuration, L2
   regularisation and gradient clipping, respectively.
-- `patience`, `early_stop_delta`: Early-stopping parameters—thanks to
-  `min_epochs`, the model now gathers more evidence before halting.
-- `label_smoothing`: Adds a small amount of smoothing to the cross-entropy
-  targets, which often stabilises convergence on noisy radio datasets.
+- `patience`, `early_stop_delta`: Early-stopping parameters—thanks to the
+  higher patience (60 epochs) and minimum duration the optimiser now explores
+  more of the schedule before halting.
+- `label_smoothing`: Adds a small amount (0.03) of smoothing to the
+  cross-entropy targets, which often stabilises convergence on noisy radio
+  datasets.
 - `log_interval`: Optional intra-epoch logging cadence.
 
 The loader standardises each channel (zero mean, unit variance) using
@@ -45,7 +47,8 @@ statistics estimated from the training split and reuses the same parameters for
 validation/testing, minimising covariate shift.  The script automatically
 splits the training file into training and validation subsets (90 %/10 % by
 default with stratification), evaluates on the dedicated test file, trains the
-lightweight CNN–Transformer architecture and saves:
+lightweight CNN–Transformer architecture (now capped at 192 hidden units to
+mitigate overfitting) and saves:
 
 - The best model weights (`best_model.pt`).
 - Training curves for loss, accuracy and the epoch-wise learning rate
