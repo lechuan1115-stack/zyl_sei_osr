@@ -44,16 +44,16 @@ class TrainingConfig:
     train_data: Path = Path(r"E:\数据集\ADS-B_Train_10X360-2_5-10-15-20dB.mat")
     test_data: Path = Path(r"E:\数据集\ADS-B_Test_10X360-2_5-10-15-20dB.mat")
     output_dir: Path = Path("training_outputs")
-    epochs: int = 120
+    epochs: int = 150
     batch_size: int = 128
-    lr: float = 5e-4
-    min_lr: float = 5e-5
-    weight_decay: float = 5e-5
-    warmup_epochs: int = 8
-    patience: int = 20
-    min_epochs: int = 25
-    early_stop_delta: float = 5e-5
-    max_grad_norm: float = 5.0
+    lr: float = 1.2e-3
+    min_lr: float = 1e-5
+    weight_decay: float = 1e-4
+    warmup_epochs: int = 5
+    patience: int = 35
+    min_epochs: int = 45
+    early_stop_delta: float = 1e-4
+    max_grad_norm: float = 3.0
     num_workers: int = 0
     val_ratio: float = 0.1
     feature_key: str | None = None
@@ -62,6 +62,7 @@ class TrainingConfig:
     test_label_key: str | None = None
     seed: int = 42
     log_interval: int = 50
+    label_smoothing: float = 0.05
 
     def __post_init__(self) -> None:
         # Allow users to provide string paths in custom configurations.
@@ -77,6 +78,8 @@ class TrainingConfig:
             raise ValueError("epochs must be >= min_epochs")
         if self.warmup_epochs >= self.epochs:
             self.warmup_epochs = max(0, self.epochs - 1)
+        if not 0.0 <= self.label_smoothing < 1.0:
+            raise ValueError("label_smoothing must be in [0, 1).")
 
 
 CONFIG_PATH = Path("training_config.json")
@@ -141,8 +144,8 @@ def create_dataloaders(
     test_feature_key: str | None,
     test_label_key: str | None,
     seed: int,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    train_split, val_split, test_split = create_datasets(
+) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, list[float]]]:
+    train_split, val_split, test_split, normalisation = create_datasets(
         train_mat_path,
         test_mat_path=test_mat_path,
         val_ratio=val_ratio,
@@ -166,7 +169,7 @@ def create_dataloaders(
     train_loader = DataLoader(train_dataset, shuffle=True, drop_last=False, **loader_kwargs)
     val_loader = DataLoader(val_dataset, shuffle=False, drop_last=False, **loader_kwargs)
     test_loader = DataLoader(test_dataset, shuffle=False, drop_last=False, **loader_kwargs)
-    return train_loader, val_loader, test_loader
+    return train_loader, val_loader, test_loader, normalisation
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +545,7 @@ def main() -> None:
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_loader, val_loader, test_loader = create_dataloaders(
+    train_loader, val_loader, test_loader, normalisation = create_dataloaders(
         config.train_data,
         test_mat_path=config.test_data,
         val_ratio=config.val_ratio,
@@ -555,6 +558,11 @@ def main() -> None:
         seed=config.seed,
     )
 
+    print(
+        "Normalisation (per-channel mean/std):",
+        {k: [round(vv, 6) for vv in values] for k, values in normalisation.items()},
+    )
+
     split_summaries = [
         _summarise_split("Train", train_loader.dataset),
         _summarise_split("Valid", val_loader.dataset),
@@ -564,7 +572,7 @@ def main() -> None:
     num_classes = len(np.unique(train_loader.dataset.labels.cpu().numpy()))
     model = create_model("CNN_Transformer", num_classes=num_classes).to(device)
 
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.lr, weight_decay=config.weight_decay
     )
@@ -667,6 +675,7 @@ def main() -> None:
         "test_accuracy": test_acc,
         "dataset_summaries": split_summaries,
         "best_epoch": best_snapshot,
+        "normalisation": normalisation,
         "config": {
             key: str(value) if isinstance(value, Path) else value
             for key, value in config.__dict__.items()
