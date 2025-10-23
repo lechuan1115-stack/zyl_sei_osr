@@ -28,11 +28,12 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import numpy as np
 import torch
+import torch.nn as nn
 from sklearn.manifold import TSNE
 from sklearn.metrics import auc, precision_recall_curve, roc_curve
 from torch.utils.data import DataLoader
 
-from mydata_read import ADSBSignalDataset, load_adsb_dataset
+from mydata_read import ADSBSignalDataset, create_datasets
 from mymodel1 import create as create_model
 
 
@@ -54,6 +55,13 @@ class OpenSetConfig:
     tail_size: int = 25
     alpha: int = 5
     seed: int = 42
+    val_ratio: float = 0.1
+    feature_key: str | None = None
+    label_key: str | None = None
+    test_feature_key: str | None = None
+    test_label_key: str | None = None
+    temperature_lr: float = 5e-3
+    temperature_steps: int = 500
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +110,39 @@ def _extract_embeddings(
     features = np.concatenate(features_list, axis=0)
     labels = np.concatenate(labels_list, axis=0)
     return logits, features, labels
+
+
+def _calibrate_temperature(
+    logits: np.ndarray,
+    labels: np.ndarray,
+    device: torch.device,
+    *,
+    lr: float,
+    steps: int,
+) -> float:
+    """Estimate a temperature scaling factor using known-class validation logits."""
+
+    if logits.size == 0:
+        return 1.0
+
+    logits_tensor = torch.from_numpy(logits).to(device)
+    labels_tensor = torch.from_numpy(labels.astype(np.int64, copy=False)).to(device)
+
+    log_temperature = torch.zeros(1, device=device, requires_grad=True)
+    optimizer = torch.optim.Adam([log_temperature], lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    for _ in range(steps):
+        optimizer.zero_grad()
+        temperature = torch.exp(log_temperature)
+        loss = criterion(logits_tensor / temperature, labels_tensor)
+        loss.backward()
+        optimizer.step()
+
+    with torch.no_grad():
+        temperature = torch.exp(log_temperature).clamp(min=1e-3, max=1e3).item()
+
+    return float(temperature)
 
 
 # ---------------------------------------------------------------------------
@@ -529,20 +570,28 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
     # ------------------------------------------------------------------
     # Load datasets and split into known/unknown partitions
     # ------------------------------------------------------------------
-    train_data, train_labels = load_adsb_dataset(config.train_data)
-    test_data, test_labels = load_adsb_dataset(config.test_data)
+    train_split, val_split, test_split = create_datasets(
+        config.train_data,
+        test_mat_path=config.test_data,
+        val_ratio=config.val_ratio,
+        feature_key=config.feature_key,
+        label_key=config.label_key,
+        test_feature_key=config.test_feature_key,
+        test_label_key=config.test_label_key,
+        random_state=config.seed,
+    )
 
-    known_mask_train = np.isin(train_labels, config.known_classes)
-    known_train_data = train_data[known_mask_train]
-    known_train_labels = train_labels[known_mask_train]
+    def _filter_known(split_data: np.ndarray, split_labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        mask = np.isin(split_labels, config.known_classes)
+        return split_data[mask], split_labels[mask]
 
-    known_mask_test = np.isin(test_labels, config.known_classes)
-    known_test_data = test_data[known_mask_test]
-    known_test_labels = test_labels[known_mask_test]
+    known_train_data, known_train_labels = _filter_known(train_split.data, train_split.labels)
+    known_val_data, known_val_labels = _filter_known(val_split.data, val_split.labels)
+    known_test_data, known_test_labels = _filter_known(test_split.data, test_split.labels)
 
-    unknown_mask_test = ~known_mask_test
-    unknown_test_data = test_data[unknown_mask_test]
-    unknown_test_labels = test_labels[unknown_mask_test]
+    test_mask_known = np.isin(test_split.labels, config.known_classes)
+    unknown_test_data = test_split.data[~test_mask_known]
+    unknown_test_labels = test_split.labels[~test_mask_known]
 
     if known_train_data.size == 0 or known_test_data.size == 0:
         raise RuntimeError(
@@ -555,19 +604,20 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
             "Ensure classes beyond the known set remain present for open-set evaluation."
         )
 
-    unknown_class_ids = sorted(set(int(label) for label in unknown_test_labels.tolist()))
+    unknown_class_ids = sorted(set(int(cls) for cls in np.unique(unknown_test_labels)))
 
     print(
-        f"Known training samples: {known_train_data.shape[0]} | "
-        f"Known test samples: {known_test_data.shape[0]} | "
+        f"Known train/val/test samples: {known_train_data.shape[0]} / {known_val_data.shape[0]} / {known_test_data.shape[0]} | "
         f"Unknown test samples: {unknown_test_data.shape[0]} | "
         f"Unknown class ids: {unknown_class_ids}"
     )
 
+    num_known_classes = len(config.known_classes)
+
     # ------------------------------------------------------------------
     # Load the trained classifier
     # ------------------------------------------------------------------
-    model = create_model("CNN_Transformer", num_classes=len(config.known_classes)).to(device)
+    model = create_model("CNN_Transformer", num_classes=num_known_classes).to(device)
     state_dict = torch.load(config.checkpoint_path, map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
@@ -576,12 +626,61 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
     # Extract embeddings
     # ------------------------------------------------------------------
     train_loader = _build_dataloader(known_train_data, known_train_labels, config.batch_size)
+    val_loader = (
+        _build_dataloader(known_val_data, known_val_labels, config.batch_size)
+        if known_val_data.size
+        else None
+    )
     known_test_loader = _build_dataloader(known_test_data, known_test_labels, config.batch_size)
     unknown_test_loader = _build_dataloader(unknown_test_data, unknown_test_labels, config.batch_size)
 
     train_logits, train_features, train_labels_known = _extract_embeddings(model, train_loader, device)
+    if val_loader is not None:
+        val_logits, val_features, val_labels_known = _extract_embeddings(model, val_loader, device)
+    else:
+        val_logits = np.empty((0, num_known_classes), dtype=np.float32)
+        val_features = np.empty((0, train_features.shape[1]), dtype=np.float32)
+        val_labels_known = np.empty((0,), dtype=np.int64)
     known_logits, known_features, known_labels = _extract_embeddings(model, known_test_loader, device)
     unknown_logits, unknown_features, _ = _extract_embeddings(model, unknown_test_loader, device)
+
+    # ------------------------------------------------------------------
+    # Feature normalisation & temperature scaling
+    # ------------------------------------------------------------------
+    feature_mean = train_features.mean(axis=0, keepdims=True)
+    feature_std = train_features.std(axis=0, keepdims=True)
+    feature_std[feature_std < 1e-6] = 1e-6
+
+    def _standardise(features: np.ndarray) -> np.ndarray:
+        if features.size == 0:
+            return features
+        return (features - feature_mean) / feature_std
+
+    train_features = _standardise(train_features)
+    val_features = _standardise(val_features)
+    known_features = _standardise(known_features)
+    unknown_features = _standardise(unknown_features)
+
+    temperature = _calibrate_temperature(
+        val_logits,
+        val_labels_known,
+        device,
+        lr=config.temperature_lr,
+        steps=config.temperature_steps,
+    ) if val_logits.size else 1.0
+
+    temperature = float(np.clip(temperature, 1e-3, 1e3))
+    print(f"Calibrated temperature: {temperature:.3f}")
+
+    def _apply_temperature(logits: np.ndarray) -> np.ndarray:
+        if logits.size == 0:
+            return logits
+        return logits / temperature
+
+    train_logits = _apply_temperature(train_logits)
+    val_logits = _apply_temperature(val_logits)
+    known_logits = _apply_temperature(known_logits)
+    unknown_logits = _apply_temperature(unknown_logits)
 
     # ------------------------------------------------------------------
     # Prepare detectors
@@ -625,19 +724,20 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
 
     # Entropy
     eps = 1e-12
-    num_known_classes = len(config.known_classes)
     entropy_norm = max(math.log(num_known_classes), 1e-6)
     entropy_known = -np.sum(known_softmax * np.log(known_softmax + eps), axis=1) / entropy_norm
     entropy_unknown = -np.sum(unknown_softmax * np.log(unknown_softmax + eps), axis=1) / entropy_norm
     _compute_unknown_scores(entropy_known, entropy_unknown, "Entropy")
 
-    # Energy
-    energy_known = -_logsumexp(known_logits).ravel()
-    energy_unknown = -_logsumexp(unknown_logits).ravel()
+    # Energy (scaled by calibrated temperature)
+    energy_known = -temperature * _logsumexp(known_logits).ravel()
+    energy_unknown = -temperature * _logsumexp(unknown_logits).ravel()
     _compute_unknown_scores(energy_known, energy_unknown, "Energy")
 
     # Logit margin
     def _margin_scores(logits: np.ndarray) -> np.ndarray:
+        if logits.shape[1] < 2:
+            return np.ones(logits.shape[0], dtype=np.float32)
         sorted_logits = np.sort(logits, axis=1)
         top1 = sorted_logits[:, -1]
         top2 = sorted_logits[:, -2]
@@ -724,6 +824,22 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
     with open(results_path, "w", encoding="utf-8") as fp:
         json.dump(metrics, fp, indent=2)
     print(f"Saved metrics to {results_path}")
+
+    summary_path = config.output_dir / "open_set_summary.json"
+    summary_payload = {
+        "temperature": temperature,
+        "known_classes": list(map(int, config.known_classes)),
+        "unknown_class_ids": unknown_class_ids,
+        "counts": {
+            "train_known": int(known_train_data.shape[0]),
+            "val_known": int(known_val_data.shape[0]),
+            "test_known": int(known_test_data.shape[0]),
+            "test_unknown": int(unknown_test_data.shape[0]),
+        },
+    }
+    with open(summary_path, "w", encoding="utf-8") as fp:
+        json.dump(summary_payload, fp, indent=2)
+    print(f"Saved evaluation summary to {summary_path}")
 
     _plot_roc_curves(roc_curves, config.output_dir)
     _plot_score_histograms(hist_scores, config.output_dir)
