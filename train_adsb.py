@@ -17,7 +17,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.manifold import TSNE
 from sklearn.metrics import classification_report
 from torch.utils.data import DataLoader, TensorDataset
 import torch.nn.functional as F
@@ -33,14 +32,8 @@ from pytorchtools import EarlyStopping
 from torch.nn.utils import clip_grad_norm_
 from utils import AverageMeter
 
-from open_set import (
-    OpenMaxCalibrator,
-    OpenSetSplit,
-    determine_open_set_split,
-    evaluate_open_set_methods,
-    extract_features,
-    filter_by_classes,
-)
+from open_set import OpenSetSplit, determine_open_set_split, filter_by_classes
+from open_set_pipeline import run_open_set_pipeline
 
 # ---------------------------------------------------------------------------
 # Configuration and reproducibility helpers
@@ -68,26 +61,6 @@ class TrainingConfig:
     patience: int = 20
     min_epochs: int = 20
     early_stop_delta: float = 1e-4
-    """Runtime configuration loaded before kicking off training.
-
-    The defaults are ready for the ADS-B dataset described in the project
-    README.  Adjust the paths or any hyper-parameters below and simply run the
-    script without additional command-line arguments.
-    """
-
-    train_data: Path = Path(r"E:\数据集\ADS-B_Train_10X360-2_5-10-15-20dB.mat")
-    test_data: Path = Path(r"E:\数据集\ADS-B_Test_10X360-2_5-10-15-20dB.mat")
-    output_dir: Path = Path("training_outputs")
-    epochs: int = 180
-    batch_size: int = 128
-    lr: float = 8e-4
-    min_lr: float = 5e-5
-    weight_decay: float = 5e-5
-    warmup_epochs: int = 12
-    patience: int = 60
-    min_epochs: int = 70
-    early_stop_delta: float = 5e-5
-    max_grad_norm: float = 2.0
     num_workers: int = 0
     val_ratio: float = 0.1
     feature_key: str | None = None
@@ -124,63 +97,6 @@ class PreparedData:
     unknown_pool_labels: np.ndarray
     known_train_data: np.ndarray
     known_train_labels: np.ndarray
-    log_interval: int = 50
-    label_smoothing: float = 0.03
-
-    def __post_init__(self) -> None:
-        # Allow users to provide string paths in custom configurations.
-        self.train_data = Path(self.train_data)
-        self.test_data = Path(self.test_data)
-        self.output_dir = Path(self.output_dir)
-
-        if self.warmup_epochs < 0:
-            raise ValueError("warmup_epochs must be non-negative")
-        if self.min_epochs < 1:
-            raise ValueError("min_epochs must be at least 1")
-        if self.epochs < self.min_epochs:
-            raise ValueError("epochs must be >= min_epochs")
-        if self.warmup_epochs >= self.epochs:
-            self.warmup_epochs = max(0, self.epochs - 1)
-        if not 0.0 <= self.label_smoothing < 1.0:
-            raise ValueError("label_smoothing must be in [0, 1).")
-
-
-CONFIG_PATH = Path("training_config.json")
-
-
-def load_config() -> TrainingConfig:
-    """Load configuration from ``training_config.json`` if present.
-
-    Users who prefer editing JSON can copy the generated template, otherwise the
-    defaults defined in :class:`TrainingConfig` are used.
-    """
-
-    if CONFIG_PATH.exists():
-        with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
-            user_config = json.load(fp)
-
-        valid_keys = TrainingConfig.__dataclass_fields__.keys()
-        filtered_config = {k: v for k, v in user_config.items() if k in valid_keys}
-        if len(filtered_config) != len(user_config):
-            unknown = sorted(set(user_config) - set(filtered_config))
-            if unknown:
-                print(
-                    "Ignoring unsupported configuration keys:",
-                    ", ".join(unknown),
-                )
-        return TrainingConfig(**filtered_config)
-
-    # When no user configuration exists we still provide a template so that the
-    # required keys are obvious for the next run.
-    if not CONFIG_PATH.exists():
-        with open(CONFIG_PATH, "w", encoding="utf-8") as fp:
-            json.dump(TrainingConfig().__dict__, fp, indent=2, default=str)
-        print(
-            "Generated training_config.json with default values. "
-            "Update the dataset paths before the next run if needed."
-        )
-
-    return TrainingConfig()
 
 
 def set_seed(seed: int) -> None:
@@ -222,28 +138,6 @@ def prepare_dataloaders(config: TrainingConfig) -> PreparedData:
     )
     known_test_data, known_test_labels_raw = filter_by_classes(
         test_split.data, test_split.labels, open_split.known_classes
-def create_dataloaders(
-    train_mat_path: Path,
-    *,
-    test_mat_path: Path,
-    val_ratio: float,
-    batch_size: int,
-    num_workers: int,
-    feature_key: str | None,
-    label_key: str | None,
-    test_feature_key: str | None,
-    test_label_key: str | None,
-    seed: int,
-) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, list[float]]]:
-    train_split, val_split, test_split, normalisation = create_datasets(
-        train_mat_path,
-        test_mat_path=test_mat_path,
-        val_ratio=val_ratio,
-        feature_key=feature_key,
-        label_key=label_key,
-        test_feature_key=test_feature_key,
-        test_label_key=test_label_key,
-        random_state=seed,
     )
 
     known_train_labels = remap(known_train_labels_raw)
@@ -315,34 +209,6 @@ def create_dataloaders(
         known_train_data=known_train_data,
         known_train_labels=known_train_labels,
     )
-    test_loader = DataLoader(test_dataset, shuffle=False, drop_last=False, **loader_kwargs)
-    return train_loader, val_loader, test_loader, normalisation
-
-
-# ---------------------------------------------------------------------------
-# Logging helpers
-# ---------------------------------------------------------------------------
-
-
-def _summarise_split(name: str, dataset: ADSBSignalDataset) -> Dict[str, object]:
-    """Log and return a concise summary for a dataset split."""
-
-    labels = dataset.labels.cpu().numpy()
-    unique, counts = np.unique(labels, return_counts=True)
-    distribution = {int(label): int(count) for label, count in zip(unique, counts)}
-
-    summary = {
-        "name": name,
-        "num_samples": int(len(dataset)),
-        "class_distribution": distribution,
-    }
-
-    print(
-        f"{name}: {summary['num_samples']:6d} samples | "
-        f"classes: {sorted(distribution.keys())}"
-    )
-    print(f"        Class distribution: {distribution}")
-    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -683,6 +549,19 @@ def plot_tsne_embeddings(
     fig.savefig(output_dir / "tsne_open_set.png", dpi=300)
     plt.close(fig)
 
+def adjust_learning_rate(optimizer: torch.optim.Optimizer, epoch: int, config: TrainingConfig) -> float:
+    if epoch <= config.warmup_epochs:
+        lr = config.lr * epoch / max(1, config.warmup_epochs)
+    else:
+        progress = (epoch - config.warmup_epochs) / max(1, config.epochs - config.warmup_epochs)
+        lr = config.min_lr + 0.5 * (config.lr - config.min_lr) * (1 + math.cos(math.pi * progress))
+
+    lr = max(lr, config.min_lr)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+    return lr
+
+
 # ---------------------------------------------------------------------------
 # Visualisation helpers
 # ---------------------------------------------------------------------------
@@ -891,8 +770,6 @@ def plot_confidence_histogram(
 
 
 def main(config: TrainingConfig = DEFAULT_CONFIG) -> None:
-def main() -> None:
-    config = load_config()
     set_seed(config.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -909,46 +786,6 @@ def main() -> None:
 
     num_classes = len(prepared.open_split.known_classes)
     model = create_model("CNN_Transformer", num_classes=num_classes).to(device)
-    missing_paths = [
-        (name, path)
-        for name, path in (("train_data", config.train_data), ("test_data", config.test_data))
-        if not path.exists()
-    ]
-    if missing_paths:
-        formatted = ", ".join(f"{name}='{path}'" for name, path in missing_paths)
-        raise SystemExit(
-            f"Could not locate the following paths: {formatted}. "
-            "Edit training_config.json to point to the correct files."
-        )
-
-    config.output_dir.mkdir(parents=True, exist_ok=True)
-
-    train_loader, val_loader, test_loader, normalisation = create_dataloaders(
-        config.train_data,
-        test_mat_path=config.test_data,
-        val_ratio=config.val_ratio,
-        batch_size=config.batch_size,
-        num_workers=config.num_workers,
-        feature_key=config.feature_key,
-        label_key=config.label_key,
-        test_feature_key=config.test_feature_key,
-        test_label_key=config.test_label_key,
-        seed=config.seed,
-    )
-
-    print(
-        "Normalisation (per-channel mean/std):",
-        {k: [round(vv, 6) for vv in values] for k, values in normalisation.items()},
-    )
-
-    split_summaries = [
-        _summarise_split("Train", train_loader.dataset),
-        _summarise_split("Valid", val_loader.dataset),
-        _summarise_split("Test", test_loader.dataset),
-    ]
-
-    num_classes = len(np.unique(train_loader.dataset.labels.cpu().numpy()))
-    model = CNN_Transformer(num_classes=num_classes).to(device)
 
     criterion = torch.nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
     optimizer = torch.optim.AdamW(
@@ -1119,6 +956,23 @@ def main() -> None:
     plt.close(fig)
 
     # ----------------------- Open-set evaluation -------------------------
+    run_open_set_pipeline(
+        model,
+        train_loader,
+        known_test_loader,
+        unknown_test_loader,
+        unknown_pool=prepared.unknown_pool_data,
+        num_classes=num_classes,
+        open_split=prepared.open_split,
+        config=config,
+        device=device,
+        output_dir=config.output_dir,
+    )
+
+    print(
+        "Open-set evaluation complete. Metrics saved to",
+        config.output_dir / "open_set_metrics.json",
+    )
     train_logits, train_features, train_labels = extract_features(
         model, train_loader, device
     )
