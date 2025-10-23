@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 -*-
-"""Model definitions used by the ADS-B classification training script.
+"""Model definition used by the ADS-B classification training script.
 
 Only the :class:`CNN_Transformer` architecture is retained because it offers
 the best trade-off between capacity and generalisation on the 10-class ADS-B
@@ -27,24 +27,14 @@ class CNN_Transformer(nn.Module):
 
     Parameters
     ----------
-    num_classes:
+    num_cls:
         Number of output classes.  Defaults to 10 for the ADS-B dataset but can
-        be overridden for other experiments.  ``num_cls`` is accepted as an
-        alias for backwards compatibility.
+        be overridden for other experiments.
     """
 
-    def __init__(
-        self,
-        num_classes: int = 10,
-        *,
-        num_cls: int | None = None,
-    ) -> None:
+    def __init__(self, num_cls: int = 10) -> None:
         super().__init__()
-
-        if num_cls is not None:
-            # Allow older checkpoints or scripts that still pass ``num_cls`` to
-            # keep functioning without modification.
-            num_classes = num_cls
+        self.num_cls = num_cls
 
         # The convolutional trunk uses modest channel counts and GELU
         # activations.  Pooling every block halves the temporal resolution so
@@ -94,7 +84,7 @@ class CNN_Transformer(nn.Module):
         self.classifier = nn.Sequential(
             nn.LayerNorm(192),
             nn.Dropout(0.25),
-            nn.Linear(192, num_classes),
+            nn.Linear(192, num_cls),
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

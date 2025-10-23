@@ -570,7 +570,7 @@ def main() -> None:
     ]
 
     num_classes = len(np.unique(train_loader.dataset.labels.cpu().numpy()))
-    model = CNN_Transformer(num_classes=num_classes).to(device)
+    model = CNN_Transformer(num_cls=num_classes).to(device)
 
     criterion = torch.nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
     optimizer = torch.optim.AdamW(
