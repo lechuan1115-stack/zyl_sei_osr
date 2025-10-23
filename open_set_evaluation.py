@@ -106,6 +106,26 @@ def _extract_embeddings(
 
 
 # ---------------------------------------------------------------------------
+# Logit handling
+# ---------------------------------------------------------------------------
+
+
+def _suppress_unknown_logits(
+    logits: np.ndarray,
+    known_classes: Sequence[int],
+    total_classes: int,
+    fill_value: float = -1e9,
+) -> np.ndarray:
+    """Mask logits that correspond to classes not considered known."""
+
+    mask = np.ones(total_classes, dtype=bool)
+    mask[list(known_classes)] = False
+    suppressed = logits.copy()
+    suppressed[:, mask] = fill_value
+    return suppressed
+
+
+# ---------------------------------------------------------------------------
 # OpenMax implementation
 # ---------------------------------------------------------------------------
 
@@ -570,6 +590,9 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
     known_logits, known_features, known_labels = _extract_embeddings(model, known_test_loader, device)
     unknown_logits, unknown_features, _ = _extract_embeddings(model, unknown_test_loader, device)
 
+    known_logits = _suppress_unknown_logits(known_logits, config.known_classes, config.total_classes)
+    unknown_logits = _suppress_unknown_logits(unknown_logits, config.known_classes, config.total_classes)
+
     # ------------------------------------------------------------------
     # Prepare detectors
     # ------------------------------------------------------------------
@@ -612,12 +635,10 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
 
     # Entropy
     eps = 1e-12
-    entropy_known = -np.sum(known_softmax * np.log(known_softmax + eps), axis=1) / math.log(
-        config.total_classes
-    )
-    entropy_unknown = -np.sum(unknown_softmax * np.log(unknown_softmax + eps), axis=1) / math.log(
-        config.total_classes
-    )
+    num_known_classes = len(config.known_classes)
+    entropy_norm = max(math.log(num_known_classes), 1e-6)
+    entropy_known = -np.sum(known_softmax * np.log(known_softmax + eps), axis=1) / entropy_norm
+    entropy_unknown = -np.sum(unknown_softmax * np.log(unknown_softmax + eps), axis=1) / entropy_norm
     _compute_unknown_scores(entropy_known, entropy_unknown, "Entropy")
 
     # Energy
