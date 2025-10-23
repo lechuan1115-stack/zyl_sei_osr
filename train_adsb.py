@@ -4,10 +4,10 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import random
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -24,136 +24,97 @@ from Confusion_matrix import plot_confusion_matrix
 from mydata_read import ADSBSignalDataset, create_datasets
 from mymodel1 import create as create_model
 from pytorchtools import EarlyStopping
+from torch.nn.utils import clip_grad_norm_
 from utils import AverageMeter
 
 # ---------------------------------------------------------------------------
-# Argument parsing and reproducibility helpers
+# Configuration and reproducibility helpers
 # ---------------------------------------------------------------------------
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--train-data",
-        type=Path,
-        required=True,
-        help=(
-            "Path to the MATLAB v7.3 (.mat) file containing the training "
-            "samples (will be split into train/validation)."
-        ),
-    )
-    parser.add_argument(
-        "--test-data",
-        type=Path,
-        required=True,
-        help="Path to the MATLAB v7.3 (.mat) file containing the held-out test set.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("training_outputs"),
-        help="Directory where models, logs and figures will be stored.",
-    )
-    parser.add_argument("--epochs", type=int, default=80, help="Maximum number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=128, help="Mini-batch size.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate.")
-    parser.add_argument(
-        "--lr-factor",
-        type=float,
-        default=0.5,
-        help=(
-            "Multiplicative factor applied to the learning rate when the validation "
-            "loss stagnates."
-        ),
-    )
-    parser.add_argument(
-        "--lr-patience",
-        type=int,
-        default=4,
-        help="Number of epochs with no improvement before the learning rate is reduced.",
-    )
-    parser.add_argument(
-        "--lr-threshold",
-        type=float,
-        default=1e-4,
-        help="Minimum relative improvement in validation loss to avoid LR reduction.",
-    )
-    parser.add_argument(
-        "--min-lr",
-        type=float,
-        default=1e-6,
-        help="Lower bound applied to the adaptive learning rate scheduler.",
-    )
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=1e-4,
-        help="Weight decay used by the AdamW optimiser.",
-    )
-    parser.add_argument(
-        "--patience",
-        type=int,
-        default=12,
-        help="Number of epochs with no validation improvement before early stopping.",
-    )
-    parser.add_argument(
-        "--early-stop-delta",
-        type=float,
-        default=1e-4,
-        help="Minimum absolute validation-loss improvement required to reset early stopping.",
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=0,
-        help="Number of worker processes used by the dataloaders.",
-    )
-    parser.add_argument(
-        "--val-ratio",
-        type=float,
-        default=0.1,
-        help="Fraction of the training set used for validation (0 < ratio < 1).",
-    )
-    parser.add_argument(
-        "--feature-key",
-        type=str,
-        default=None,
-        help="Optional dataset key containing the feature tensor.  Leave unset to auto-detect.",
-    )
-    parser.add_argument(
-        "--label-key",
-        type=str,
-        default=None,
-        help="Optional dataset key containing the labels.  Leave unset to auto-detect.",
-    )
-    parser.add_argument(
-        "--test-feature-key",
-        type=str,
-        default=None,
-        help="Optional dataset key containing the test feature tensor.",
-    )
-    parser.add_argument(
-        "--test-label-key",
-        type=str,
-        default=None,
-        help="Optional dataset key containing the test labels.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed used for dataset splitting and weight initialisation.",
-    )
-    parser.add_argument(
-        "--log-interval",
-        type=int,
-        default=0,
-        help=(
-            "Print intermediate training statistics every N batches. "
-            "Set to 0 to disable in-epoch logging."
-        ),
-    )
-    return parser.parse_args()
+@dataclass
+class TrainingConfig:
+    """Runtime configuration loaded before kicking off training.
+
+    The defaults are ready for the ADS-B dataset described in the project
+    README.  Adjust the paths or any hyper-parameters below and simply run the
+    script without additional command-line arguments.
+    """
+
+    train_data: Path = Path(r"E:\数据集\ADS-B_Train_10X360-2_5-10-15-20dB.mat")
+    test_data: Path = Path(r"E:\数据集\ADS-B_Test_10X360-2_5-10-15-20dB.mat")
+    output_dir: Path = Path("training_outputs")
+    epochs: int = 120
+    batch_size: int = 128
+    lr: float = 5e-4
+    min_lr: float = 5e-5
+    weight_decay: float = 5e-5
+    warmup_epochs: int = 8
+    patience: int = 20
+    min_epochs: int = 25
+    early_stop_delta: float = 5e-5
+    max_grad_norm: float = 5.0
+    num_workers: int = 0
+    val_ratio: float = 0.1
+    feature_key: str | None = None
+    label_key: str | None = None
+    test_feature_key: str | None = None
+    test_label_key: str | None = None
+    seed: int = 42
+    log_interval: int = 50
+
+    def __post_init__(self) -> None:
+        # Allow users to provide string paths in custom configurations.
+        self.train_data = Path(self.train_data)
+        self.test_data = Path(self.test_data)
+        self.output_dir = Path(self.output_dir)
+
+        if self.warmup_epochs < 0:
+            raise ValueError("warmup_epochs must be non-negative")
+        if self.min_epochs < 1:
+            raise ValueError("min_epochs must be at least 1")
+        if self.epochs < self.min_epochs:
+            raise ValueError("epochs must be >= min_epochs")
+        if self.warmup_epochs >= self.epochs:
+            self.warmup_epochs = max(0, self.epochs - 1)
+
+
+CONFIG_PATH = Path("training_config.json")
+
+
+def load_config() -> TrainingConfig:
+    """Load configuration from ``training_config.json`` if present.
+
+    Users who prefer editing JSON can copy the generated template, otherwise the
+    defaults defined in :class:`TrainingConfig` are used.
+    """
+
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
+            user_config = json.load(fp)
+
+        valid_keys = TrainingConfig.__dataclass_fields__.keys()
+        filtered_config = {k: v for k, v in user_config.items() if k in valid_keys}
+        if len(filtered_config) != len(user_config):
+            unknown = sorted(set(user_config) - set(filtered_config))
+            if unknown:
+                print(
+                    "Ignoring unsupported configuration keys:",
+                    ", ".join(unknown),
+                )
+        return TrainingConfig(**filtered_config)
+
+    # When no user configuration exists we still provide a template so that the
+    # required keys are obvious for the next run.
+    if not CONFIG_PATH.exists():
+        with open(CONFIG_PATH, "w", encoding="utf-8") as fp:
+            json.dump(TrainingConfig().__dict__, fp, indent=2, default=str)
+        print(
+            "Generated training_config.json with default values. "
+            "Update the dataset paths before the next run if needed."
+        )
+
+    return TrainingConfig()
 
 
 def set_seed(seed: int) -> None:
@@ -239,6 +200,30 @@ def _summarise_split(name: str, dataset: ADSBSignalDataset) -> Dict[str, object]
 # ---------------------------------------------------------------------------
 
 
+def compute_epoch_lr(
+    *,
+    base_lr: float,
+    min_lr: float,
+    epoch: int,
+    total_epochs: int,
+    warmup_epochs: int,
+) -> float:
+    """Cosine decay with linear warm-up."""
+
+    epoch_index = epoch - 1
+    if warmup_epochs > 0 and epoch_index < warmup_epochs:
+        scale = (epoch_index + 1) / warmup_epochs
+        return max(min_lr, base_lr * scale)
+
+    if total_epochs <= warmup_epochs:
+        return max(min_lr, base_lr)
+
+    progress = (epoch_index - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+    cosine = 0.5 * (1 + np.cos(np.pi * np.clip(progress, 0.0, 1.0)))
+    lr = min_lr + (base_lr - min_lr) * cosine
+    return max(min_lr, lr)
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     dataloader: DataLoader,
@@ -249,6 +234,7 @@ def train_one_epoch(
     epoch: int,
     total_epochs: int,
     log_interval: int,
+    max_grad_norm: float | None,
 ) -> Tuple[float, float]:
     model.train()
     loss_meter = AverageMeter()
@@ -262,6 +248,8 @@ def train_one_epoch(
         outputs, _ = model(inputs)
         loss = criterion(outputs, targets)
         loss.backward()
+        if max_grad_norm is not None and max_grad_norm > 0:
+            clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
 
         preds = outputs.argmax(dim=1)
@@ -271,10 +259,10 @@ def train_one_epoch(
 
         if log_interval > 0 and batch_idx % log_interval == 0:
             print(
-                f"  [Epoch {epoch:03d}/{total_epochs:03d} | Batch {batch_idx:04d}/"
-                f"{len(dataloader):04d}] "
-                f"loss={loss_meter.avg:.4f} acc={acc_meter.avg * 100:.2f}%"
-            )
+            f"  [Epoch {epoch:03d}/{total_epochs:03d} | Batch {batch_idx:04d}/"
+            f"{len(dataloader):04d}] "
+            f"loss={loss_meter.avg:.4f} acc={acc_meter.avg * 100:.2f}%"
+        )
 
     return loss_meter.avg, acc_meter.avg
 
@@ -334,7 +322,7 @@ def evaluate(
 def plot_training_curves(history: Dict[str, list], output_dir: Path) -> None:
     epochs = range(1, len(history["train_loss"]) + 1)
 
-    fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+    fig, ax = plt.subplots(1, 3, figsize=(16, 4))
 
     ax[0].plot(epochs, history["train_loss"], label="Train", marker="o")
     ax[0].plot(epochs, history["val_loss"], label="Validation", marker="o")
@@ -351,6 +339,12 @@ def plot_training_curves(history: Dict[str, list], output_dir: Path) -> None:
     ax[1].set_ylabel("Accuracy")
     ax[1].grid(True, linestyle="--", alpha=0.5)
     ax[1].legend()
+
+    ax[2].plot(epochs, history["lr"], color="#9467bd", marker="o")
+    ax[2].set_title("Learning rate schedule")
+    ax[2].set_xlabel("Epoch")
+    ax[2].set_ylabel("Learning rate")
+    ax[2].grid(True, linestyle="--", alpha=0.5)
 
     fig.tight_layout()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -528,25 +522,37 @@ def plot_confidence_histogram(
 
 
 def main() -> None:
-    args = parse_args()
-    set_seed(args.seed)
+    config = load_config()
+    set_seed(config.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    missing_paths = [
+        (name, path)
+        for name, path in (("train_data", config.train_data), ("test_data", config.test_data))
+        if not path.exists()
+    ]
+    if missing_paths:
+        formatted = ", ".join(f"{name}='{path}'" for name, path in missing_paths)
+        raise SystemExit(
+            f"Could not locate the following paths: {formatted}. "
+            "Edit training_config.json to point to the correct files."
+        )
+
+    config.output_dir.mkdir(parents=True, exist_ok=True)
 
     train_loader, val_loader, test_loader = create_dataloaders(
-        args.train_data,
-        test_mat_path=args.test_data,
-        val_ratio=args.val_ratio,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        feature_key=args.feature_key,
-        label_key=args.label_key,
-        test_feature_key=args.test_feature_key,
-        test_label_key=args.test_label_key,
-        seed=args.seed,
+        config.train_data,
+        test_mat_path=config.test_data,
+        val_ratio=config.val_ratio,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        feature_key=config.feature_key,
+        label_key=config.label_key,
+        test_feature_key=config.test_feature_key,
+        test_label_key=config.test_label_key,
+        seed=config.seed,
     )
 
     split_summaries = [
@@ -560,23 +566,13 @@ def main() -> None:
 
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=args.lr_factor,
-        patience=args.lr_patience,
-        threshold=args.lr_threshold,
-        threshold_mode="rel",
-        min_lr=args.min_lr,
-        verbose=True,
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
     )
     early_stopping = EarlyStopping(
-        patience=args.patience,
+        patience=config.patience,
         verbose=True,
-        path=str(args.output_dir / "best_model.pt"),
-        delta=args.early_stop_delta,
+        path=str(config.output_dir / "best_model.pt"),
+        delta=config.early_stop_delta,
     )
 
     history: Dict[str, list] = {
@@ -584,6 +580,7 @@ def main() -> None:
         "val_loss": [],
         "train_acc": [],
         "val_acc": [],
+        "lr": [],
     }
 
     best_snapshot = {
@@ -592,8 +589,17 @@ def main() -> None:
         "val_acc": 0.0,
     }
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, config.epochs + 1):
         epoch_start = time.time()
+        current_lr = compute_epoch_lr(
+            base_lr=config.lr,
+            min_lr=config.min_lr,
+            epoch=epoch,
+            total_epochs=config.epochs,
+            warmup_epochs=config.warmup_epochs,
+        )
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = current_lr
         train_loss, train_acc = train_one_epoch(
             model,
             train_loader,
@@ -601,29 +607,31 @@ def main() -> None:
             optimizer,
             device,
             epoch=epoch,
-            total_epochs=args.epochs,
-            log_interval=args.log_interval,
+            total_epochs=config.epochs,
+            log_interval=config.log_interval,
+            max_grad_norm=config.max_grad_norm,
         )
         val_loss, val_acc, _ = evaluate(
             model, val_loader, criterion, device
         )
-
-        scheduler.step(val_loss)
         early_stopping(val_loss, model)
+        if epoch <= config.min_epochs:
+            early_stopping.early_stop = False
+            early_stopping.counter = 0
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["train_acc"].append(train_acc)
         history["val_acc"].append(val_acc)
+        history["lr"].append(current_lr)
 
         if val_loss < best_snapshot["val_loss"]:
             best_snapshot.update({"epoch": epoch, "val_loss": val_loss, "val_acc": val_acc})
 
-        lr = optimizer.param_groups[0]["lr"]
         elapsed = time.time() - epoch_start
         print(
-            f"Epoch {epoch:03d}/{args.epochs:03d} | "
-            f"lr={lr:.6f} | "
+            f"Epoch {epoch:03d}/{config.epochs:03d} | "
+            f"lr={current_lr:.6f} | "
             f"train_loss={train_loss:.4f} train_acc={train_acc * 100:.2f}% | "
             f"val_loss={val_loss:.4f} val_acc={val_acc * 100:.2f}% | "
             f"best_val_acc={best_snapshot['val_acc'] * 100:.2f}% (epoch {best_snapshot['epoch']:03d}) | "
@@ -635,11 +643,11 @@ def main() -> None:
             break
 
     # Restore the best checkpoint (lowest validation loss).
-    best_model_path = args.output_dir / "best_model.pt"
+    best_model_path = config.output_dir / "best_model.pt"
     if best_model_path.exists():
         model.load_state_dict(torch.load(best_model_path, map_location=device))
 
-    plot_training_curves(history, args.output_dir)
+    plot_training_curves(history, config.output_dir)
 
     # Evaluate on the held-out test set.
     test_loss, test_acc, test_details = evaluate(
@@ -659,8 +667,12 @@ def main() -> None:
         "test_accuracy": test_acc,
         "dataset_summaries": split_summaries,
         "best_epoch": best_snapshot,
+        "config": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in config.__dict__.items()
+        },
     }
-    with open(args.output_dir / "metrics.json", "w", encoding="utf-8") as fp:
+    with open(config.output_dir / "metrics.json", "w", encoding="utf-8") as fp:
         json.dump(metrics, fp, indent=2)
 
     report = classification_report(
@@ -670,10 +682,10 @@ def main() -> None:
         output_dict=True,
         zero_division=0,
     )
-    with open(args.output_dir / "classification_report.json", "w", encoding="utf-8") as fp:
+    with open(config.output_dir / "classification_report.json", "w", encoding="utf-8") as fp:
         json.dump(report, fp, indent=2)
 
-    plot_per_class_accuracy(report, args.output_dir)
+    plot_per_class_accuracy(report, config.output_dir)
 
     class_names = [f"Class {idx}" for idx in sorted(np.unique(y_true))]
     fig = plot_confusion_matrix(
@@ -682,7 +694,7 @@ def main() -> None:
         class_names=class_names,
         normalize=True,
         title="Normalised confusion matrix",
-        save_path=args.output_dir / "confusion_matrix.png",
+        save_path=config.output_dir / "confusion_matrix.png",
     )
     plt.close(fig)
 
@@ -693,15 +705,15 @@ def main() -> None:
         class_names=class_names,
         normalize=False,
         title="Confusion matrix (counts)",
-        save_path=args.output_dir / "confusion_matrix_counts.png",
+        save_path=config.output_dir / "confusion_matrix_counts.png",
     )
     plt.close(fig)
 
-    plot_tsne_embeddings(features, y_true, args.output_dir, seed=args.seed)
-    plot_distance_distributions(features, y_true, args.output_dir, seed=args.seed)
-    plot_confidence_histogram(probabilities, y_pred, y_true, args.output_dir)
+    plot_tsne_embeddings(features, y_true, config.output_dir, seed=config.seed)
+    plot_distance_distributions(features, y_true, config.output_dir, seed=config.seed)
+    plot_confidence_histogram(probabilities, y_pred, y_true, config.output_dir)
 
-    print("Training artefacts written to", args.output_dir.resolve())
+    print("Training artefacts written to", config.output_dir.resolve())
 
 
 if __name__ == "__main__":  # pragma: no cover - script entry point

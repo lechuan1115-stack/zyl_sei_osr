@@ -13,35 +13,38 @@ channels (in-phase and quadrature).
    (e.g. `ADS-B_Test_10X360-2_5-10-15-20dB.mat` with 3 600 labelled examples).
    Each file must expose a complex I/Q tensor named `signal` (shape
    `(num_samples, 4800, 2)` or an equivalent permutation such as
-   `(2, 4800, num_samples)`) and a `label` array.  Custom keys can be provided
-   through command-line arguments if required.
-2. Launch the training script:
+   `(2, 4800, num_samples)`) and a `label` array.  If the tensors are stored
+   under different keys, simply edit the configuration file generated in the
+   next step.
+2. Launch the training script once with `python train_adsb.py`.  If a
+   `training_config.json` file does not yet exist, the script will generate a
+   template alongside helpful defaults (including the Windows paths mentioned
+   above) and exit with a message prompting you to edit the dataset locations.
+   Subsequent runs will read the JSON configuration directly and start the
+   training loop without requiring any command-line options.
 
-```bash
-python train_adsb.py \
-    --train-data path/to/ADS-B_Train_10X360-2_5-10-15-20dB.mat \
-    --test-data path/to/ADS-B_Test_10X360-2_5-10-15-20dB.mat \
-    --output-dir outputs/adsb_run \
-    --epochs 80 \
-    --batch-size 128 \
-    --log-interval 50
-```
+All runtime options are driven by `training_config.json`.  The notable entries
+include:
 
-Additional flags are available for specifying dataset keys inside the `.mat`
-files (`--feature-key`/`--label-key` for the training file and
-`--test-feature-key`/`--test-label-key` for the test file), selecting the
-validation ratio (`--val-ratio`), adjusting optimiser and scheduler
-hyper-parameters (`--lr-factor`, `--lr-patience`, `--lr-threshold`, `--min-lr`)
-and controlling early stopping sensitivity (`--patience`, `--early-stop-delta`).
-Use `--log-interval` to display intra-epoch progress updates including the
-running recognition rate.
+- `train_data` / `test_data`: Absolute or relative paths to the MATLAB files.
+- `epochs`, `warmup_epochs`, `min_epochs`: Control the total training duration,
+  the length of the linear warm-up and the minimum number of epochs to run
+  before early stopping is allowed to trigger.
+- `lr` / `min_lr`: Define the cosine learning-rate schedule that decays from the
+  peak learning rate (`lr`) towards the floor (`min_lr`).
+- `batch_size`, `weight_decay`, `max_grad_norm`: Batch configuration, L2
+  regularisation and gradient clipping, respectively.
+- `patience`, `early_stop_delta`: Early-stopping parameters—thanks to
+  `min_epochs`, the model now gathers more evidence before halting.
+- `log_interval`: Optional intra-epoch logging cadence.
 
 The script automatically splits the training file into training and validation
 subsets (90 %/10 % by default with stratification), evaluates on the dedicated
 test file, trains the lightweight CNN–Transformer architecture and saves:
 
 - The best model weights (`best_model.pt`).
-- Training curves for loss and accuracy (`training_curves.png`).
+- Training curves for loss, accuracy and the epoch-wise learning rate
+  (`training_curves.png`).
 - Normalised and raw confusion matrices (`confusion_matrix.png` and
   `confusion_matrix_counts.png`).
 - A per-class accuracy bar chart (`per_class_accuracy.png`) to quickly spot
@@ -54,4 +57,5 @@ test file, trains the lightweight CNN–Transformer architecture and saves:
 - JSON files containing the training history, final metrics and a detailed
   classification report.
 
-All outputs are placed in the directory specified via `--output-dir`.
+All outputs are placed in the directory specified via `output_dir` in the
+configuration file.
