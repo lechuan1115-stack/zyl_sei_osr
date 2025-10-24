@@ -165,7 +165,14 @@ def _calibrate_temperature(
 class WeibullCalibrator:
     """OpenMax calibrator with smoothed unknown activation."""
 
-    def __init__(self, tail_size: int, alpha: int, *, gate_scale: float = 0.5, blend: float = 0.6) -> None:
+    def __init__(
+        self,
+        tail_size: int = 25,
+        alpha: int = 3,
+        *,
+        gate_scale: float = 0.5,
+        blend: float = 0.6,
+    ) -> None:
         self.tail_size = tail_size
         self.alpha = alpha
         self.gate_scale = gate_scale
