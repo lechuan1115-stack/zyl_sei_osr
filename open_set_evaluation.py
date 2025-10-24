@@ -1,19 +1,16 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 -*-
-"""Open-set evaluation utilities for the ADS-B classifier.
+"""Optimised open-set evaluation for the ADS-B classifier.
 
-This module leaves the closed-set training script untouched while providing a
-stand-alone workflow that can be executed after the classifier has been trained
-on the first seven classes only.  During open-set evaluation the trained model
-is exposed to the full ten-class dataset: classes 0--6 are treated as known
-while classes 7--9 serve as unknown examples.  The script benchmarks a suite of
-open-set detectors including OpenMax, MSP, entropy, energy, logit-margin,
-Mahalanobis, Gaussian NLL, prototype distances, KL-to-uniform, and inverse
-feature-norm baselines while producing quantitative metrics together with
-visual diagnostics saved under ``open_set_outputs/``.
+This module keeps the closed-set training script untouched while providing a
+stand-alone workflow that benchmarks several detectors – Mahalanobis distance,
+Gaussian negative log-likelihood, Euclidean prototype distance, cosine
+prototype distance, inverse feature norm, and a smoothed OpenMax variant.
 
-The entry point is :func:`run_open_set_evaluation`, which can be executed
-directly via ``python open_set_evaluation.py``.
+Compared with the previous implementation, the OpenMax recalibration has been
+tempered using per-class tail statistics, a logistic gate, and probability
+blending so that the unknown probabilities avoid the pathological 0/1 collapse
+observed earlier.
 """
 
 from __future__ import annotations
@@ -34,7 +31,7 @@ from sklearn.metrics import auc, precision_recall_curve, roc_curve
 from torch.utils.data import DataLoader
 
 from mydata_read import ADSBSignalDataset, create_datasets
-from mymodel1 import create as create_model
+from mymodel1 import CNN_Transformer
 
 
 # ---------------------------------------------------------------------------
@@ -44,16 +41,14 @@ from mymodel1 import create as create_model
 
 @dataclass
 class OpenSetConfig:
-    """Configuration container for the open-set evaluation pipeline."""
-
     train_data: Path = Path(r"E:\数据集\ADS-B_Train_10X360-2_5-10-15-20dB.mat")
     test_data: Path = Path(r"E:\数据集\ADS-B_Test_10X360-2_5-10-15-20dB.mat")
     checkpoint_path: Path = Path("training_outputs/best_model.pt")
     output_dir: Path = Path("open_set_outputs")
     batch_size: int = 256
     known_classes: Sequence[int] = tuple(range(7))
+    alpha: int = 3  # number of top activations to recalibrate in OpenMax
     tail_size: int = 25
-    alpha: int = 5
     seed: int = 42
     val_ratio: float = 0.1
     feature_key: str | None = None
@@ -65,7 +60,7 @@ class OpenSetConfig:
 
 
 # ---------------------------------------------------------------------------
-# Data utilities
+# Utility helpers
 # ---------------------------------------------------------------------------
 
 
@@ -106,10 +101,29 @@ def _extract_embeddings(
             features_list.append(features.cpu().numpy())
             labels_list.append(targets.cpu().numpy())
 
+    if not logits_list:  # pragma: no cover - defensive branch for empty loaders
+        num_classes = model.classifier[-1].out_features
+        feature_dim = model.classifier[-1].in_features
+        return (
+            np.empty((0, num_classes), dtype=np.float32),
+            np.empty((0, feature_dim), dtype=np.float32),
+            np.empty((0,), dtype=np.int64),
+        )
+
     logits = np.concatenate(logits_list, axis=0)
     features = np.concatenate(features_list, axis=0)
     labels = np.concatenate(labels_list, axis=0)
     return logits, features, labels
+
+
+def _softmax(logits: np.ndarray) -> np.ndarray:
+    shifted = logits - logits.max(axis=1, keepdims=True)
+    exp_scores = np.exp(shifted)
+    return exp_scores / exp_scores.sum(axis=1, keepdims=True)
+
+
+def _feature_norm(features: np.ndarray) -> np.ndarray:
+    return np.linalg.norm(features, axis=1)
 
 
 def _calibrate_temperature(
@@ -120,8 +134,6 @@ def _calibrate_temperature(
     lr: float,
     steps: int,
 ) -> float:
-    """Estimate a temperature scaling factor using known-class validation logits."""
-
     if logits.size == 0:
         return 1.0
 
@@ -146,16 +158,19 @@ def _calibrate_temperature(
 
 
 # ---------------------------------------------------------------------------
-# OpenMax implementation
+# Smoothed OpenMax implementation
 # ---------------------------------------------------------------------------
 
 
 class WeibullCalibrator:
-    """Fits Weibull models on activation distances for OpenMax."""
+    """OpenMax calibrator with smoothed unknown activation."""
 
-    def __init__(self, tail_size: int, alpha: int) -> None:
+    def __init__(self, tail_size: int, alpha: int, *, gate_scale: float = 0.5, blend: float = 0.6) -> None:
         self.tail_size = tail_size
         self.alpha = alpha
+        self.gate_scale = gate_scale
+        self.blend = blend
+
         self.class_means: Dict[int, np.ndarray] = {}
         self.shapes: Dict[int, float] = {}
         self.scales: Dict[int, float] = {}
@@ -177,22 +192,24 @@ class WeibullCalibrator:
             distances = np.linalg.norm(cls_features - mean_vector, axis=1)
             tail = np.sort(distances)[-min(self.tail_size, len(distances)) :]
             tail = tail[tail > 0]
+
             if tail.size < 2:
-                # Degenerate case: fall back to a small scale to avoid division by zero.
                 shape, scale = 1.0, max(float(np.max(distances)), 1e-6)
             else:
                 shape, scale = _fit_weibull_tail(tail)
 
             tail_mean = float(tail.mean()) if tail.size else float(distances.mean())
-            tail_std = float(tail.std(ddof=0)) if tail.size > 1 else float(
-                distances.std(ddof=0) if distances.size else 1.0
-            )
+            if tail.size > 1:
+                tail_std = float(tail.std(ddof=0))
+            else:
+                tail_std = float(distances.std(ddof=0)) if distances.size else 1.0
+            tail_std = max(tail_std, 1e-6)
 
             self.class_means[cls] = mean_vector
             self.shapes[cls] = shape
             self.scales[cls] = scale
             self.tail_means[cls] = tail_mean
-            self.tail_stds[cls] = max(tail_std, 1e-6)
+            self.tail_stds[cls] = tail_std
 
     def recalibrate(
         self,
@@ -201,45 +218,63 @@ class WeibullCalibrator:
     ) -> Tuple[np.ndarray, float]:
         ranked = np.argsort(logits)[::-1]
         alpha = min(self.alpha, len(ranked))
-        recalibrated = logits.copy()
+        recalibrated = logits.copy().astype(np.float64)
+        base_probs = _softmax(logits[None, :])[0]
+
         unknown_activation = 0.0
+        total_weight = 0.0
 
         for rank, cls in enumerate(ranked[:alpha], start=1):
             if cls not in self.class_means:
                 continue
+
             mean = self.class_means[cls]
             shape = self.shapes[cls]
             scale = self.scales[cls]
             distance = float(np.linalg.norm(feature - mean))
             survival = math.exp(-((distance / (scale + 1e-12)) ** shape))
-            weight = (alpha - rank + 1) / alpha
+            cdf = 1.0 - survival
 
             tail_mean = self.tail_means.get(cls, 0.0)
             tail_std = self.tail_stds.get(cls, 1.0)
             z_score = (distance - tail_mean) / tail_std
-            z_score -= 0.5  # encourage smaller weights near the tail boundary
-            logistic_weight = 1.0 / (1.0 + math.exp(-z_score))
+            logistic_gate = 1.0 / (1.0 + math.exp(-(z_score / max(self.gate_scale, 1e-6))))
 
-            cdf = 1.0 - survival
-            blended = 0.5 * cdf + 0.5 * logistic_weight
-            omega = max(0.0, min(0.95, weight * blended))
+            blended = 0.5 * cdf + 0.5 * logistic_gate
+            weight = (alpha - rank + 1) / alpha
+            omega = np.clip(weight * blended, 0.0, 0.65)
+
             adjusted = logits[cls] * (1 - omega)
             unknown_activation += logits[cls] - adjusted
+            total_weight += omega
             recalibrated[cls] = adjusted
 
-        unknown_activation /= (alpha + 1e-6)
+        normaliser = max(total_weight, 1e-6)
+        avg_logit = max(float(np.mean(np.abs(logits))), 1e-3)
+        unknown_scaled = max(unknown_activation, 0.0) / (normaliser * avg_logit)
+        unknown_logit = math.log1p(unknown_scaled)
+        unknown_logit = float(np.clip(unknown_logit, -4.0, 4.0))
 
-        augmented = np.concatenate([recalibrated, np.array([unknown_activation], dtype=np.float32)])
+        augmented = np.concatenate([recalibrated, np.array([unknown_logit], dtype=np.float64)])
         max_logit = float(np.max(augmented))
         exp_scores = np.exp(augmented - max_logit)
-        probabilities = exp_scores / exp_scores.sum()
-        unknown_probability = float(probabilities[-1])
-        return probabilities[:-1], unknown_probability
+        recalibrated_probs = exp_scores / exp_scores.sum()
+
+        known_probs = recalibrated_probs[:-1]
+        unknown_prob = float(recalibrated_probs[-1])
+
+        blend = np.clip(self.blend, 0.0, 1.0)
+        blended_known = (1.0 - blend) * base_probs + blend * known_probs
+        blended_unknown = blend * unknown_prob + (1.0 - blend) * (1.0 / (len(base_probs) + 1))
+
+        total = blended_known.sum() + blended_unknown
+        blended_known /= total
+        blended_unknown /= total
+
+        return blended_known.astype(np.float32), float(blended_unknown)
 
 
 def _fit_weibull_tail(tail: np.ndarray) -> Tuple[float, float]:
-    """Estimate Weibull shape/scale parameters via Newton iterations."""
-
     tail = tail.astype(np.float64)
     logs = np.log(tail)
     k = 1.0
@@ -266,108 +301,6 @@ def _fit_weibull_tail(tail: np.ndarray) -> Tuple[float, float]:
 
     scale = (tail ** k).mean() ** (1.0 / k)
     return float(k), float(scale)
-
-
-# ---------------------------------------------------------------------------
-# Detector scores
-# ---------------------------------------------------------------------------
-
-
-def _softmax(logits: np.ndarray) -> np.ndarray:
-    shifted = logits - logits.max(axis=1, keepdims=True)
-    exp_scores = np.exp(shifted)
-    return exp_scores / exp_scores.sum(axis=1, keepdims=True)
-
-
-def _logsumexp(logits: np.ndarray) -> np.ndarray:
-    max_logits = logits.max(axis=1, keepdims=True)
-    return max_logits + np.log(np.exp(logits - max_logits).sum(axis=1, keepdims=True))
-
-
-def _kl_to_uniform(logits: np.ndarray) -> np.ndarray:
-    probs = _softmax(logits)
-    num_classes = probs.shape[1]
-    uniform = 1.0 / num_classes
-    kl = np.sum(probs * (np.log(probs + 1e-12) - math.log(uniform)), axis=1)
-    return 1.0 / (kl + 1e-6)
-
-
-def _feature_norm(features: np.ndarray) -> np.ndarray:
-    return np.linalg.norm(features, axis=1)
-
-
-def _compute_mahalanobis_stats(
-    features: np.ndarray,
-    labels: np.ndarray,
-    known_classes: Sequence[int],
-    epsilon: float = 1e-6,
-) -> Tuple[Dict[int, np.ndarray], np.ndarray, float]:
-    means: Dict[int, np.ndarray] = {}
-    centered: List[np.ndarray] = []
-
-    for cls in known_classes:
-        cls_features = features[labels == cls]
-        if cls_features.size == 0:
-            raise RuntimeError(f"No features available for class {cls}.")
-        mean = cls_features.mean(axis=0)
-        means[cls] = mean
-        centered.append(cls_features - mean)
-
-    stacked = np.vstack(centered)
-    covariance = np.cov(stacked, rowvar=False, bias=True)
-    covariance += epsilon * np.eye(covariance.shape[0], dtype=covariance.dtype)
-    precision = np.linalg.inv(covariance)
-    sign, logdet = np.linalg.slogdet(covariance)
-    if sign <= 0:
-        # Fall back to an explicit determinant to avoid invalid logarithms.
-        logdet = float(np.log(np.abs(np.linalg.det(covariance)) + 1e-12))
-    return means, precision, float(logdet)
-
-
-def _mahalanobis_distance(
-    feature: np.ndarray,
-    means: Dict[int, np.ndarray],
-    precision: np.ndarray,
-) -> float:
-    distances = []
-    for mean in means.values():
-        diff = feature - mean
-        distances.append(float(diff @ precision @ diff))
-    return min(distances)
-
-
-def _gaussian_negative_log_likelihood(
-    feature: np.ndarray,
-    means: Dict[int, np.ndarray],
-    precision: np.ndarray,
-    log_det_cov: float,
-) -> float:
-    values = []
-    for mean in means.values():
-        diff = feature - mean
-        mahal = float(diff @ precision @ diff)
-        values.append(0.5 * (mahal + log_det_cov))
-    return min(values)
-
-
-def _cosine_distance(feature: np.ndarray, means: Dict[int, np.ndarray]) -> float:
-    feature_norm = np.linalg.norm(feature)
-    if feature_norm < 1e-12:
-        return 1.0
-    scores = []
-    feature_unit = feature / feature_norm
-    for mean in means.values():
-        mean_norm = np.linalg.norm(mean)
-        if mean_norm < 1e-12:
-            continue
-        cosine = float(np.dot(feature_unit, mean / mean_norm))
-        scores.append(1.0 - cosine)
-    return min(scores) if scores else 1.0
-
-
-def _euclidean_distance(feature: np.ndarray, means: Dict[int, np.ndarray]) -> float:
-    distances = [float(np.linalg.norm(feature - mean)) for mean in means.values()]
-    return min(distances)
 
 
 # ---------------------------------------------------------------------------
@@ -454,10 +387,7 @@ def _plot_roc_curves(curves: Dict[str, Tuple[np.ndarray, np.ndarray]], output_di
     plt.close()
 
 
-def _plot_score_histograms(
-    scores: Dict[str, Tuple[np.ndarray, np.ndarray]],
-    output_dir: Path,
-) -> None:
+def _plot_score_histograms(scores: Dict[str, Tuple[np.ndarray, np.ndarray]], output_dir: Path) -> None:
     cols = 2
     rows = math.ceil(len(scores) / cols)
     fig, axes = plt.subplots(rows, cols, figsize=(cols * 6, rows * 4))
@@ -569,6 +499,83 @@ def _plot_tsne(
 
 
 # ---------------------------------------------------------------------------
+# Detector utilities
+# ---------------------------------------------------------------------------
+
+
+def _compute_mahalanobis_stats(
+    features: np.ndarray,
+    labels: np.ndarray,
+    known_classes: Sequence[int],
+    epsilon: float = 1e-6,
+) -> Tuple[Dict[int, np.ndarray], np.ndarray, float]:
+    means: Dict[int, np.ndarray] = {}
+    centered: List[np.ndarray] = []
+
+    for cls in known_classes:
+        cls_features = features[labels == cls]
+        if cls_features.size == 0:
+            raise RuntimeError(f"No features available for class {cls}.")
+        mean = cls_features.mean(axis=0)
+        means[cls] = mean
+        centered.append(cls_features - mean)
+
+    stacked = np.vstack(centered)
+    covariance = np.cov(stacked, rowvar=False, bias=True)
+    covariance += epsilon * np.eye(covariance.shape[0], dtype=covariance.dtype)
+    precision = np.linalg.inv(covariance)
+    sign, logdet = np.linalg.slogdet(covariance)
+    if sign <= 0:
+        logdet = float(np.log(np.abs(np.linalg.det(covariance)) + 1e-12))
+    return means, precision, float(logdet)
+
+
+def _mahalanobis_distance(
+    feature: np.ndarray,
+    means: Dict[int, np.ndarray],
+    precision: np.ndarray,
+) -> float:
+    distances = []
+    for mean in means.values():
+        diff = feature - mean
+        distances.append(float(diff @ precision @ diff))
+    return min(distances)
+
+
+def _gaussian_negative_log_likelihood(
+    feature: np.ndarray,
+    means: Dict[int, np.ndarray],
+    precision: np.ndarray,
+    log_det_cov: float,
+) -> float:
+    values = []
+    for mean in means.values():
+        diff = feature - mean
+        mahal = float(diff @ precision @ diff)
+        values.append(0.5 * (mahal + log_det_cov))
+    return min(values)
+
+
+def _euclidean_distance(feature: np.ndarray, means: Dict[int, np.ndarray]) -> float:
+    return min(float(np.linalg.norm(feature - mean)) for mean in means.values())
+
+
+def _cosine_distance(feature: np.ndarray, means: Dict[int, np.ndarray]) -> float:
+    feature_norm = np.linalg.norm(feature)
+    if feature_norm < 1e-12:
+        return 1.0
+    feature_unit = feature / feature_norm
+    scores = []
+    for mean in means.values():
+        mean_norm = np.linalg.norm(mean)
+        if mean_norm < 1e-12:
+            continue
+        cosine = float(np.dot(feature_unit, mean / mean_norm))
+        scores.append(1.0 - cosine)
+    return min(scores) if scores else 1.0
+
+
+# ---------------------------------------------------------------------------
 # Main evaluation routine
 # ---------------------------------------------------------------------------
 
@@ -587,9 +594,6 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Load datasets and split into known/unknown partitions
-    # ------------------------------------------------------------------
     train_split, val_split, test_split = create_datasets(
         config.train_data,
         test_mat_path=config.test_data,
@@ -601,50 +605,37 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
         random_state=config.seed,
     )
 
-    def _filter_known(split_data: np.ndarray, split_labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        mask = np.isin(split_labels, config.known_classes)
-        return split_data[mask], split_labels[mask]
+    def _filter_known(data: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        mask = np.isin(labels, config.known_classes)
+        return data[mask], labels[mask]
 
     known_train_data, known_train_labels = _filter_known(train_split.data, train_split.labels)
     known_val_data, known_val_labels = _filter_known(val_split.data, val_split.labels)
     known_test_data, known_test_labels = _filter_known(test_split.data, test_split.labels)
 
-    test_mask_known = np.isin(test_split.labels, config.known_classes)
-    unknown_test_data = test_split.data[~test_mask_known]
-    unknown_test_labels = test_split.labels[~test_mask_known]
+    test_known_mask = np.isin(test_split.labels, config.known_classes)
+    unknown_test_data = test_split.data[~test_known_mask]
+    unknown_test_labels = test_split.labels[~test_known_mask]
 
     if known_train_data.size == 0 or known_test_data.size == 0:
-        raise RuntimeError(
-            "No samples from the configured known classes were found. "
-            "Check that the training pipeline used the same label indices."
-        )
+        raise RuntimeError("No samples from the configured known classes were found.")
     if unknown_test_data.size == 0:
-        raise RuntimeError(
-            "No unknown-class samples detected in the test dataset. "
-            "Ensure classes beyond the known set remain present for open-set evaluation."
-        )
+        raise RuntimeError("No unknown-class samples detected in the test dataset.")
 
-    unknown_class_ids = sorted(set(int(cls) for cls in np.unique(unknown_test_labels)))
-
+    unknown_class_ids = sorted(map(int, np.unique(unknown_test_labels)))
     print(
-        f"Known train/val/test samples: {known_train_data.shape[0]} / {known_val_data.shape[0]} / {known_test_data.shape[0]} | "
+        f"Known train/val/test samples: {known_train_data.shape[0]} / "
+        f"{known_val_data.shape[0]} / {known_test_data.shape[0]} | "
         f"Unknown test samples: {unknown_test_data.shape[0]} | "
         f"Unknown class ids: {unknown_class_ids}"
     )
 
     num_known_classes = len(config.known_classes)
-
-    # ------------------------------------------------------------------
-    # Load the trained classifier
-    # ------------------------------------------------------------------
-    model = create_model("CNN_Transformer", num_classes=num_known_classes).to(device)
+    model = CNN_Transformer(num_cls=num_known_classes).to(device)
     state_dict = torch.load(config.checkpoint_path, map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
 
-    # ------------------------------------------------------------------
-    # Extract embeddings
-    # ------------------------------------------------------------------
     train_loader = _build_dataloader(known_train_data, known_train_labels, config.batch_size)
     val_loader = (
         _build_dataloader(known_val_data, known_val_labels, config.batch_size)
@@ -664,17 +655,14 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
     known_logits, known_features, known_labels = _extract_embeddings(model, known_test_loader, device)
     unknown_logits, unknown_features, _ = _extract_embeddings(model, unknown_test_loader, device)
 
-    # ------------------------------------------------------------------
-    # Feature normalisation & temperature scaling
-    # ------------------------------------------------------------------
     feature_mean = train_features.mean(axis=0, keepdims=True)
     feature_std = train_features.std(axis=0, keepdims=True)
     feature_std[feature_std < 1e-6] = 1e-6
 
-    def _standardise(features: np.ndarray) -> np.ndarray:
-        if features.size == 0:
-            return features
-        return (features - feature_mean) / feature_std
+    def _standardise(feat: np.ndarray) -> np.ndarray:
+        if feat.size == 0:
+            return feat
+        return (feat - feature_mean) / feature_std
 
     train_features = _standardise(train_features)
     val_features = _standardise(val_features)
@@ -688,7 +676,6 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
         lr=config.temperature_lr,
         steps=config.temperature_steps,
     ) if val_logits.size else 1.0
-
     temperature = float(np.clip(temperature, 1e-3, 1e3))
     print(f"Calibrated temperature: {temperature:.3f}")
 
@@ -702,9 +689,6 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
     known_logits = _apply_temperature(known_logits)
     unknown_logits = _apply_temperature(unknown_logits)
 
-    # ------------------------------------------------------------------
-    # Prepare detectors
-    # ------------------------------------------------------------------
     weibull = WeibullCalibrator(tail_size=config.tail_size, alpha=config.alpha)
     weibull.fit(train_features, train_labels_known, config.known_classes)
 
@@ -712,23 +696,14 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
         train_features, train_labels_known, config.known_classes
     )
 
-    known_softmax = _softmax(known_logits)
-    unknown_softmax = _softmax(unknown_logits)
     known_feature_norms = _feature_norm(known_features)
     unknown_feature_norms = _feature_norm(unknown_features)
 
-    # ------------------------------------------------------------------
-    # Compute detector scores
-    # ------------------------------------------------------------------
     roc_curves: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
     hist_scores: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
     metrics: Dict[str, Dict[str, float]] = {}
 
-    def _compute_unknown_scores(
-        known_scores: np.ndarray,
-        unknown_scores: np.ndarray,
-        name: str,
-    ) -> None:
+    def _commit(known_scores: np.ndarray, unknown_scores: np.ndarray, name: str) -> None:
         roc_fpr, roc_tpr, _ = roc_curve(
             np.concatenate([np.zeros_like(known_scores), np.ones_like(unknown_scores)]),
             np.concatenate([known_scores, unknown_scores]),
@@ -737,49 +712,16 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
         hist_scores[name] = (known_scores, unknown_scores)
         metrics[name] = _compute_metrics(known_scores, unknown_scores, known_logits, known_labels)
 
-    # MSP
-    msp_known = 1.0 - known_softmax.max(axis=1)
-    msp_unknown = 1.0 - unknown_softmax.max(axis=1)
-    _compute_unknown_scores(msp_known, msp_unknown, "MSP")
-
-    # Entropy
-    eps = 1e-12
-    entropy_norm = max(math.log(num_known_classes), 1e-6)
-    entropy_known = -np.sum(known_softmax * np.log(known_softmax + eps), axis=1) / entropy_norm
-    entropy_unknown = -np.sum(unknown_softmax * np.log(unknown_softmax + eps), axis=1) / entropy_norm
-    _compute_unknown_scores(entropy_known, entropy_unknown, "Entropy")
-
-    # Energy (scaled by calibrated temperature)
-    energy_known = -temperature * _logsumexp(known_logits).ravel()
-    energy_unknown = -temperature * _logsumexp(unknown_logits).ravel()
-    _compute_unknown_scores(energy_known, energy_unknown, "Energy")
-
-    # Logit margin
-    def _margin_scores(logits: np.ndarray) -> np.ndarray:
-        if logits.shape[1] < 2:
-            return np.ones(logits.shape[0], dtype=np.float32)
-        sorted_logits = np.sort(logits, axis=1)
-        top1 = sorted_logits[:, -1]
-        top2 = sorted_logits[:, -2]
-        margin = top1 - top2
-        return 1.0 / (margin + 1e-6)
-
-    margin_known = _margin_scores(known_logits)
-    margin_unknown = _margin_scores(unknown_logits)
-    _compute_unknown_scores(margin_known, margin_unknown, "Logit margin")
-
-    # Mahalanobis
-    mahalanobis_known = np.array(
+    maha_known = np.array(
         [_mahalanobis_distance(feat, class_means, precision) for feat in known_features],
         dtype=np.float32,
     )
-    mahalanobis_unknown = np.array(
+    maha_unknown = np.array(
         [_mahalanobis_distance(feat, class_means, precision) for feat in unknown_features],
         dtype=np.float32,
     )
-    _compute_unknown_scores(mahalanobis_known, mahalanobis_unknown, "Mahalanobis")
+    _commit(maha_known, maha_unknown, "Mahalanobis")
 
-    # Gaussian NLL
     gaussian_known = np.array(
         [
             _gaussian_negative_log_likelihood(feat, class_means, precision, log_det_cov)
@@ -794,52 +736,44 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
         ],
         dtype=np.float32,
     )
-    _compute_unknown_scores(gaussian_known, gaussian_unknown, "Gaussian NLL")
+    _commit(gaussian_known, gaussian_unknown, "Gaussian NLL")
 
-    # Euclidean distance to class prototypes
     euclidean_known = np.array(
         [_euclidean_distance(feat, class_means) for feat in known_features], dtype=np.float32
     )
     euclidean_unknown = np.array(
         [_euclidean_distance(feat, class_means) for feat in unknown_features], dtype=np.float32
     )
-    _compute_unknown_scores(euclidean_known, euclidean_unknown, "Euclidean distance")
+    _commit(euclidean_known, euclidean_unknown, "Euclidean distance")
 
-    # Cosine distance to class prototypes
     cosine_known = np.array(
         [_cosine_distance(feat, class_means) for feat in known_features], dtype=np.float32
     )
     cosine_unknown = np.array(
         [_cosine_distance(feat, class_means) for feat in unknown_features], dtype=np.float32
     )
-    _compute_unknown_scores(cosine_known, cosine_unknown, "Cosine distance")
+    _commit(cosine_known, cosine_unknown, "Cosine distance")
 
-    # KL divergence to uniform distribution (lower divergence -> more unknown)
-    kl_known = _kl_to_uniform(known_logits)
-    kl_unknown = _kl_to_uniform(unknown_logits)
-    _compute_unknown_scores(kl_known, kl_unknown, "KL to uniform")
+    inv_norm_known = 1.0 / (known_feature_norms + 1e-6)
+    inv_norm_unknown = 1.0 / (unknown_feature_norms + 1e-6)
+    _commit(inv_norm_known, inv_norm_unknown, "Inverse feature norm")
 
-    # Feature norm (smaller norms often correlate with unknowns)
-    norm_known = 1.0 / (known_feature_norms + 1e-6)
-    norm_unknown = 1.0 / (unknown_feature_norms + 1e-6)
-    _compute_unknown_scores(norm_known, norm_unknown, "Inverse feature norm")
-
-    # OpenMax
     openmax_known = []
     openmax_unknown = []
     for logit, feat in zip(known_logits, known_features):
-        _, unknown_prob = weibull.recalibrate(logit, feat)
-        openmax_known.append(unknown_prob)
+        _, unk = weibull.recalibrate(logit, feat)
+        openmax_known.append(unk)
     for logit, feat in zip(unknown_logits, unknown_features):
-        _, unknown_prob = weibull.recalibrate(logit, feat)
-        openmax_unknown.append(unknown_prob)
+        _, unk = weibull.recalibrate(logit, feat)
+        openmax_unknown.append(unk)
     openmax_known = np.array(openmax_known, dtype=np.float32)
     openmax_unknown = np.array(openmax_unknown, dtype=np.float32)
-    _compute_unknown_scores(openmax_known, openmax_unknown, "OpenMax")
+    print(
+        "OpenMax mean unknown-prob: known=", float(openmax_known.mean()),
+        " unknown=", float(openmax_unknown.mean()),
+    )
+    _commit(openmax_known, openmax_unknown, "OpenMax")
 
-    # ------------------------------------------------------------------
-    # Persist artefacts
-    # ------------------------------------------------------------------
     results_path = config.output_dir / "open_set_metrics.json"
     with open(results_path, "w", encoding="utf-8") as fp:
         json.dump(metrics, fp, indent=2)
@@ -866,16 +800,14 @@ def run_open_set_evaluation(config: OpenSetConfig = OpenSetConfig()) -> None:
     _plot_metric_bars(metrics, config.output_dir)
     _plot_tsne(known_features, known_labels, unknown_features, config.output_dir, config.seed)
 
-    # Save raw scores for external analysis.
     scores_path = config.output_dir / "detection_scores.npz"
     score_arrays: Dict[str, np.ndarray] = {}
-    for name, (known_scores, unknown_scores) in hist_scores.items():
-        score_arrays[f"{name}_known"] = known_scores
-        score_arrays[f"{name}_unknown"] = unknown_scores
+    for name, (ks, us) in hist_scores.items():
+        score_arrays[f"{name}_known"] = ks
+        score_arrays[f"{name}_unknown"] = us
     np.savez(scores_path, **score_arrays)
     print(f"Saved detection scores to {scores_path}")
 
 
-if __name__ == "__main__":  # pragma: no cover - script entry point
+if __name__ == "__main__":
     run_open_set_evaluation()
-
