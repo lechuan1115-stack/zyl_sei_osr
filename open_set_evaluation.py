@@ -159,6 +159,8 @@ class WeibullCalibrator:
         self.class_means: Dict[int, np.ndarray] = {}
         self.shapes: Dict[int, float] = {}
         self.scales: Dict[int, float] = {}
+        self.tail_means: Dict[int, float] = {}
+        self.tail_stds: Dict[int, float] = {}
 
     def fit(
         self,
@@ -181,9 +183,16 @@ class WeibullCalibrator:
             else:
                 shape, scale = _fit_weibull_tail(tail)
 
+            tail_mean = float(tail.mean()) if tail.size else float(distances.mean())
+            tail_std = float(tail.std(ddof=0)) if tail.size > 1 else float(
+                distances.std(ddof=0) if distances.size else 1.0
+            )
+
             self.class_means[cls] = mean_vector
             self.shapes[cls] = shape
             self.scales[cls] = scale
+            self.tail_means[cls] = tail_mean
+            self.tail_stds[cls] = max(tail_std, 1e-6)
 
     def recalibrate(
         self,
@@ -204,10 +213,21 @@ class WeibullCalibrator:
             distance = float(np.linalg.norm(feature - mean))
             survival = math.exp(-((distance / (scale + 1e-12)) ** shape))
             weight = (alpha - rank + 1) / alpha
-            omega = survival * weight
+
+            tail_mean = self.tail_means.get(cls, 0.0)
+            tail_std = self.tail_stds.get(cls, 1.0)
+            z_score = (distance - tail_mean) / tail_std
+            z_score -= 0.5  # encourage smaller weights near the tail boundary
+            logistic_weight = 1.0 / (1.0 + math.exp(-z_score))
+
+            cdf = 1.0 - survival
+            blended = 0.5 * cdf + 0.5 * logistic_weight
+            omega = max(0.0, min(0.95, weight * blended))
             adjusted = logits[cls] * (1 - omega)
             unknown_activation += logits[cls] - adjusted
             recalibrated[cls] = adjusted
+
+        unknown_activation /= (alpha + 1e-6)
 
         augmented = np.concatenate([recalibrated, np.array([unknown_activation], dtype=np.float32)])
         max_logit = float(np.max(augmented))
